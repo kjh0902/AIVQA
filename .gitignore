@@ -1,0 +1,27 @@
+# Local datasets are available separately on the GPU server.
+datasets/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments and local configuration
+.venv/
+venv/
+.env
+
+# Model caches and experiment outputs
+.cache/
+huggingface_cache/
+checkpoints/
+outputs/
+runs/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

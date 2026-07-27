@@ -1,0 +1,79 @@
+# AIVQA
+
+Hugging Face Transformers로 `Qwen/Qwen3-VL-8B-Instruct`를 불러와 단일 이미지에 질문하는 최소 추론 예제입니다. Qwen 공식 GitHub 저장소는 clone하지 않으며, 모델 가중치와 processor는 첫 실행 시 Hugging Face Hub에서 자동으로 내려받습니다.
+
+## 환경 준비
+
+GPU 서버의 터미널에서 저장소 디렉터리로 이동한 뒤 Conda 환경을 만듭니다.
+
+```bash
+conda create -n aivqa python=3.11 -y
+conda activate aivqa
+python -m pip install --upgrade pip
+```
+
+RTX 50 시리즈처럼 CUDA 12.8 빌드가 필요한 환경에서는 PyTorch CUDA wheel을 먼저 설치합니다.
+
+```bash
+python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+python -m pip install -r requirements.txt
+```
+
+서버에 맞는 PyTorch가 이미 설치되어 있다면 첫 번째 명령은 생략하고 다음 명령만 실행해도 됩니다.
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+새 SSH 세션에서는 환경을 다시 활성화합니다.
+
+```bash
+conda activate aivqa
+cd /path/to/AIVQA
+```
+
+Conda 활성화가 되지 않는 최초 1회에는 `conda init bash`를 실행하고 셸을 다시 시작합니다.
+
+## 단일 이미지 질의응답
+
+저장소 루트에서 다음과 같이 실행합니다.
+
+```bash
+python infer_single_image.py \
+  --image datasets/test/0001.jpg \
+  --question "이 이미지에 무엇이 보이나요?"
+```
+
+스크립트는 processor 로드, 모델 로드, 답변 생성 단계를 표준 오류에 표시하고 최종 답변을 표준 출력에 출력합니다. 첫 실행에서는 모델 파일을 다운로드하므로 시간이 오래 걸릴 수 있습니다.
+
+생성 길이나 데이터 타입을 지정할 수도 있습니다.
+
+```bash
+python infer_single_image.py \
+  --image datasets/test/0001.jpg \
+  --question "이미지의 핵심 내용을 한국어 한 문장으로 설명해 주세요." \
+  --max-new-tokens 64 \
+  --dtype bfloat16
+```
+
+기본값은 다음과 같습니다.
+
+- 모델: `Qwen/Qwen3-VL-8B-Instruct`
+- dtype: `auto`
+- device map: `auto` (가능한 GPU를 자동 사용하고 필요하면 CPU로 일부 offload)
+- 최대 생성 길이: 128 tokens
+
+메모리가 부족하면 먼저 다른 GPU 프로세스를 종료했는지 확인하세요. `device_map=auto`가 CPU offload를 사용할 경우 실행 속도가 크게 느려질 수 있습니다.
+
+## GPU 환경 확인
+
+```bash
+nvidia-smi
+python -c "import torch; print('torch:', torch.__version__); print('cuda:', torch.cuda.is_available()); print('gpu:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'none')"
+```
+
+`cuda: True`와 GPU 이름이 출력되면 CUDA PyTorch 환경이 정상입니다.
+
+## 데이터 및 산출물
+
+`datasets/`는 로컬 및 GPU 서버에 별도로 존재하는 데이터이므로 Git에 포함하지 않습니다. 모델 캐시, 체크포인트, 실행 결과 폴더도 `.gitignore`에서 제외합니다.
