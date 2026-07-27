@@ -7,6 +7,7 @@ from .data import (
     TrainCollator,
     format_question,
 )
+from .metrics import compute_vqa_metrics
 
 __all__ = [
     "SYSTEM_PROMPT",
@@ -14,4 +15,5 @@ __all__ = [
     "QwenVQADataset",
     "TrainCollator",
     "format_question",
+    "compute_vqa_metrics",
 ]

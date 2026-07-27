@@ -108,13 +108,61 @@ generation_loader = DataLoader(
 - `GenerationCollator`: assistant 정답을 제외하고 generation prompt까지 추가합니다.
 - MC 선택지는 원본 순서를 유지하여 질문 아래에 붙이며, SA/LA의 빈 선택지 배열은 출력하지 않습니다.
 
-이번 단계에는 모델 학습 루프가 포함되어 있지 않습니다.
-
 테스트는 다음 명령으로 실행합니다.
 
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+## LoRA/DoRA 학습·검증·테스트
+
+`train_lora.py`는 36개 language decoder layer의 `q_proj`, `k_proj`, `v_proj`, `o_proj`에만 adapter를 적용합니다. Vision encoder, visual merger, LM head와 decoder의 원본 가중치는 모두 frozen 상태로 유지하며, 실행 시 대상 projection 144개와 trainable parameter 범위를 검사합니다.
+
+RTX 5070처럼 VRAM이 제한된 GPU에서는 frozen base model을 4-bit로 로드하는 옵션을 권장합니다.
+
+```bash
+conda activate aivqa
+python train_lora.py \
+  --load-in-4bit \
+  --epochs 10 \
+  --early-stopping-patience 3 \
+  --train-batch-size 1 \
+  --eval-batch-size 1 \
+  --gradient-accumulation-steps 8
+```
+
+기본 adapter는 LoRA이며 `r=16`, `alpha=32`, `dropout=0.05`입니다. DoRA는 `--use-dora`를 추가합니다.
+
+```bash
+python train_lora.py \
+  --load-in-4bit \
+  --use-dora \
+  --lora-r 16 \
+  --lora-alpha 32 \
+  --lora-dropout 0.05
+```
+
+각 epoch가 끝나면 validation 생성 평가를 수행합니다.
+
+- MC: 선택지 번호 Accuracy
+- SA: 유니코드·공백 정규화 후 Exact Match
+- LA: 한국어 토큰 기반 ROUGE-L F1과 corpus BLEU-4
+- `descriptive_avg = (ROUGE + BLEU) / 2`
+- `final_score = (MC Accuracy + SA Exact Match + descriptive_avg) / 3`
+
+`final_score`가 기존 최고값을 초과할 때 adapter 가중치를 `best_epoch.pth`에 저장합니다. 개선이 없는 epoch 수가 `--early-stopping-patience`에 도달하면 학습을 종료합니다.
+
+기본 출력 디렉터리 `outputs/qwen3_vl_lora/`에는 다음 파일이 생성됩니다.
+
+- `best_epoch.pth`
+- `training_history.json`
+- `training_history.csv`
+- `best_metrics.json`
+- `loss_curve.png`
+- `final_score_curve.png`
+- `한국문화 멀티모달 질의응답_test_predictions.json`
+
+학습 종료 후 `best_epoch.pth`를 다시 로드하고 test split에 greedy generation을 수행합니다. 예측 JSON은 원본 순서와 기존 필드를 유지하면서 `model_output.answer`만 추가하며, 원본 test JSON은 수정하지 않습니다.
 
 ## 데이터 및 산출물
 
