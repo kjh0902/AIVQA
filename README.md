@@ -126,12 +126,19 @@ RTX 5070처럼 VRAM이 제한된 GPU에서는 frozen base model을 4-bit로 로�
 conda activate aivqa
 python train_lora.py \
   --load-in-4bit \
-  --epochs 10 \
-  --early-stopping-patience 3 \
+  --epochs 20 \
+  --learning-rate 1e-4 \
+  --warmup-ratio 0.05 \
+  --early-stopping-patience 5 \
   --train-batch-size 1 \
   --eval-batch-size 1 \
-  --gradient-accumulation-steps 8
+  --gradient-accumulation-steps 8 \
+  --num-workers 2
 ```
+
+20 epoch 학습을 기준으로 기본 learning rate는 `1e-4`, warmup ratio는 `0.05`,
+early stopping patience는 `5`입니다. 배치 크기와 gradient accumulation 기본값은
+VRAM 사용량이 증가하지 않도록 각각 `1`, `1`, `8`을 유지합니다.
 
 모든 train/validation/test 이미지에는 동일한 processor pixel 제한이 적용됩니다. Qwen3-VL의 32×32 spatial compression을 기준으로 기본 범위는 약 64~512 visual tokens입니다.
 

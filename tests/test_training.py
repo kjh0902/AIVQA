@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 from train_lora import (
     DEFAULT_MAX_PIXELS,
@@ -12,6 +13,7 @@ from train_lora import (
     configure_image_pixel_limits,
     create_run_output_dir,
     find_adapter_target_modules,
+    parse_args,
     save_test_predictions,
 )
 
@@ -26,6 +28,17 @@ class _FakeProcessor:
 
 
 class TrainingUtilitiesTest(unittest.TestCase):
+    def test_longer_training_defaults(self) -> None:
+        with patch("sys.argv", ["train_lora.py"]):
+            args = parse_args()
+
+        self.assertEqual(args.epochs, 20)
+        self.assertEqual(args.num_workers, 2)
+        self.assertEqual(args.learning_rate, 1e-4)
+        self.assertEqual(args.warmup_ratio, 0.05)
+        self.assertEqual(args.early_stopping_patience, 5)
+        self.assertEqual(args.gradient_accumulation_steps, 8)
+
     def test_each_run_gets_a_unique_timestamped_output_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             output_root = Path(temp_dir) / "outputs" / "qwen3_vl_lora"
