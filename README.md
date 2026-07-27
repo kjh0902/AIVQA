@@ -168,7 +168,10 @@ python train_lora.py \
 
 `final_score`가 기존 최고값을 초과할 때 adapter 가중치를 `best_epoch.pth`에 저장합니다. 개선이 없는 epoch 수가 `--early-stopping-patience`에 도달하면 학습을 종료합니다.
 
-기본 출력 디렉터리 `outputs/qwen3_vl_lora/`에는 다음 파일이 생성됩니다.
+실행할 때마다 기본 출력 루트 `outputs/qwen3_vl_lora/` 아래에
+`run_YYYYMMDD_HHMMSS/` 형식의 새 폴더를 만들며, 다음 파일은 모두 해당
+실행 폴더에 생성됩니다. 같은 초에 여러 실행을 시작하면 `_01`, `_02` 접미사를
+붙여 기존 결과를 덮어쓰지 않습니다.
 
 - `best_epoch.pth`
 - `training_history.json`

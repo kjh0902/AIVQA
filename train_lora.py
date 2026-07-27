@@ -8,6 +8,7 @@ import math
 import random
 import re
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -48,11 +49,16 @@ def parse_args() -> argparse.Namespace:
         "--test-json", type=Path, default=DATASET_DIR / f"{DATASET_NAME}_test.json"
     )
     parser.add_argument("--dataset-root", type=Path, default=Path("datasets"))
-    parser.add_argument("--output-dir", type=Path, default=Path("outputs/qwen3_vl_lora"))
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("outputs/qwen3_vl_lora"),
+        help="Root directory where a unique run_YYYYMMDD_HHMMSS folder is created",
+    )
     parser.add_argument(
         "--test-predictions-path",
         type=Path,
-        help="Default: OUTPUT_DIR/한국문화 멀티모달 질의응답_test_predictions.json",
+        help="Default: RUN_OUTPUT_DIR/한국문화 멀티모달 질의응답_test_predictions.json",
     )
 
     parser.add_argument("--epochs", type=int, default=10)
@@ -148,6 +154,25 @@ def set_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def create_run_output_dir(
+    output_root: Path, started_at: datetime | None = None
+) -> Path:
+    """Create and return a collision-safe directory for one training run."""
+    output_root.mkdir(parents=True, exist_ok=True)
+    timestamp = (started_at or datetime.now()).strftime("%Y%m%d_%H%M%S")
+    base_name = f"run_{timestamp}"
+
+    suffix = 0
+    while True:
+        name = base_name if suffix == 0 else f"{base_name}_{suffix:02d}"
+        run_output_dir = output_root / name
+        try:
+            run_output_dir.mkdir(exist_ok=False)
+            return run_output_dir
+        except FileExistsError:
+            suffix += 1
 
 
 def find_adapter_target_modules(module_names: Iterable[str]) -> list[str]:
@@ -533,7 +558,8 @@ def main() -> int:
     from transformers import get_linear_schedule_with_warmup
 
     set_seed(args.seed)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    args.output_dir = create_run_output_dir(args.output_dir)
+    print(f"Run output directory: {args.output_dir}")
     predictions_path = args.test_predictions_path or args.output_dir / TEST_PREDICTIONS_NAME
 
     train_dataset = QwenVQADataset(args.train_json, dataset_root=args.dataset_root)

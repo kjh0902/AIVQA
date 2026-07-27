@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 from train_lora import (
     DEFAULT_MAX_PIXELS,
     DEFAULT_MIN_PIXELS,
     configure_image_pixel_limits,
+    create_run_output_dir,
     find_adapter_target_modules,
     save_test_predictions,
 )
@@ -24,6 +26,19 @@ class _FakeProcessor:
 
 
 class TrainingUtilitiesTest(unittest.TestCase):
+    def test_each_run_gets_a_unique_timestamped_output_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_root = Path(temp_dir) / "outputs" / "qwen3_vl_lora"
+            started_at = datetime(2026, 7, 27, 12, 34, 56)
+
+            first = create_run_output_dir(output_root, started_at)
+            second = create_run_output_dir(output_root, started_at)
+
+            self.assertEqual(first, output_root / "run_20260727_123456")
+            self.assertEqual(second, output_root / "run_20260727_123456_01")
+            self.assertTrue(first.is_dir())
+            self.assertTrue(second.is_dir())
+
     def test_default_pixel_budget_is_applied_to_processor(self) -> None:
         processor = _FakeProcessor()
         configure_image_pixel_limits(
