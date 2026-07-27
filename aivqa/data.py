@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
-from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
+
+from PIL import Image, ImageOps
 
 
 SYSTEM_PROMPT = (
@@ -95,6 +96,7 @@ class QwenVQADataset:
         image_path = self._resolve_image_path(split, image_name)
         if self.check_image_exists and not image_path.is_file():
             raise FileNotFoundError(f"Sample {index}: image does not exist: {image_path}")
+        image = self._load_rgb_image(image_path, index)
 
         formatted_question = format_question(question_form, question, options)
         prompt_messages = [
@@ -102,7 +104,7 @@ class QwenVQADataset:
             {
                 "role": "user",
                 "content": [
-                    {"type": "image", "image": str(image_path)},
+                    {"type": "image", "image": image},
                     {"type": "text", "text": formatted_question},
                 ],
             },
@@ -159,6 +161,17 @@ class QwenVQADataset:
             return split_path
         return direct_path
 
+    @staticmethod
+    def _load_rgb_image(image_path: Path, index: int) -> Image.Image:
+        try:
+            with Image.open(image_path) as image_file:
+                # Copy detaches the in-memory RGB image from the closed source file.
+                return ImageOps.exif_transpose(image_file).convert("RGB").copy()
+        except (OSError, ValueError) as error:
+            raise ValueError(
+                f"Sample {index}: Pillow could not decode image: {image_path}"
+            ) from error
+
 
 def _prompt_messages(feature: dict[str, Any]) -> list[dict[str, Any]]:
     messages = feature.get("messages")
@@ -166,7 +179,16 @@ def _prompt_messages(feature: dict[str, Any]) -> list[dict[str, Any]]:
         raise ValueError("Each feature must contain a non-empty messages list")
     if any(message.get("role") == "assistant" for message in messages):
         raise ValueError("Dataset messages must contain only the system/user prompt")
-    return deepcopy(messages)
+
+    # Copy the message containers without duplicating the potentially large PIL image.
+    copied_messages = []
+    for message in messages:
+        copied_message = dict(message)
+        content = message.get("content")
+        if isinstance(content, list):
+            copied_message["content"] = [dict(item) for item in content]
+        copied_messages.append(copied_message)
+    return copied_messages
 
 
 @dataclass

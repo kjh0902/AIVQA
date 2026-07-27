@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+from PIL import Image
 
 from aivqa.data import GenerationCollator, QwenVQADataset, TrainCollator
 
@@ -38,8 +39,14 @@ class DatasetTest(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)
         (self.root / "train").mkdir()
-        (self.root / "train" / "mc.jpg").touch()
-        (self.root / "train" / "sa.jpg").touch()
+        Image.new("RGB", (8, 8), color=(255, 0, 0)).save(
+            self.root / "train" / "mc.jpg", format="JPEG"
+        )
+        # Deliberately store TIFF bytes under a .jpg name to reproduce the source data.
+        Image.new("RGBA", (8, 8), color=(0, 255, 0, 128)).save(
+            self.root / "train" / "sa.jpg", format="TIFF"
+        )
+        self.original_tiff_bytes = (self.root / "train" / "sa.jpg").read_bytes()
         records = [
             {
                 "metadata": {
@@ -85,9 +92,26 @@ class DatasetTest(unittest.TestCase):
         self.assertEqual([message["role"] for message in sample["messages"]], ["system", "user"])
 
     def test_empty_options_are_not_rendered(self) -> None:
-        formatted_question = self.dataset[1]["formatted_question"]
+        sample = self.dataset[1]
+        formatted_question = sample["formatted_question"]
         self.assertNotIn("선택지:", formatted_question)
         self.assertNotIn("[]", formatted_question)
+
+        image = sample["messages"][1]["content"][0]["image"]
+        self.assertIsInstance(image, Image.Image)
+        self.assertEqual(image.mode, "RGB")
+        self.assertEqual(image.getpixel((0, 0)), (0, 255, 0))
+        self.assertEqual(
+            (self.root / "train" / "sa.jpg").read_bytes(), self.original_tiff_bytes
+        )
+
+    def test_message_copy_reuses_in_memory_image(self) -> None:
+        sample = self.dataset[0]
+        original_image = sample["messages"][1]["content"][0]["image"]
+        processor = _FakeProcessor()
+        TrainCollator(processor)([sample])
+        collated_image = processor.calls[0][0][0][1]["content"][0]["image"]
+        self.assertIs(collated_image, original_image)
 
     def test_train_collator_adds_answer_and_masks_prompt(self) -> None:
         processor = _FakeProcessor()

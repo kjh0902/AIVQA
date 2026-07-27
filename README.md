@@ -78,6 +78,8 @@ python -c "import torch; print('torch:', torch.__version__); print('cuda:', torc
 
 `aivqa.data.QwenVQADataset`은 원본 JSON을 메모리에 읽고, 각 샘플에 접근하는 시점에만 Qwen messages 형식으로 변환합니다. 원본 JSON과 이미지 파일을 수정하거나 변환 결과를 별도 파일로 저장하지 않습니다.
 
+이미지는 확장자와 실제 형식이 다른 TIFF/MPO 파일도 처리할 수 있도록 Dataset에서 Pillow로 읽고, EXIF 방향을 반영한 독립적인 RGB 메모리 객체로 processor에 전달합니다. 이 과정에서 원본 이미지 파일은 변경하거나 다시 저장하지 않습니다.
+
 ```python
 from torch.utils.data import DataLoader
 from transformers import AutoProcessor
