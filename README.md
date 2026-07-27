@@ -74,6 +74,48 @@ python -c "import torch; print('torch:', torch.__version__); print('cuda:', torc
 
 `cuda: True`와 GPU 이름이 출력되면 CUDA PyTorch 환경이 정상입니다.
 
+## Dataset과 Collator
+
+`aivqa.data.QwenVQADataset`은 원본 JSON을 메모리에 읽고, 각 샘플에 접근하는 시점에만 Qwen messages 형식으로 변환합니다. 원본 JSON과 이미지 파일을 수정하거나 변환 결과를 별도 파일로 저장하지 않습니다.
+
+```python
+from torch.utils.data import DataLoader
+from transformers import AutoProcessor
+
+from aivqa.data import GenerationCollator, QwenVQADataset, TrainCollator
+
+processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-8B-Instruct")
+train_dataset = QwenVQADataset(
+    "datasets/한국문화 멀티모달 질의응답/한국문화 멀티모달 질의응답_train.json"
+)
+
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=1,
+    shuffle=True,
+    collate_fn=TrainCollator(processor),
+)
+
+generation_loader = DataLoader(
+    train_dataset,
+    batch_size=1,
+    shuffle=False,
+    collate_fn=GenerationCollator(processor),
+)
+```
+
+- `TrainCollator`: assistant 정답을 messages에 추가하고, prompt와 padding 위치를 `-100`으로 마스킹한 `labels`를 만듭니다.
+- `GenerationCollator`: assistant 정답을 제외하고 generation prompt까지 추가합니다.
+- MC 선택지는 원본 순서를 유지하여 질문 아래에 붙이며, SA/LA의 빈 선택지 배열은 출력하지 않습니다.
+
+이번 단계에는 모델 학습 루프가 포함되어 있지 않습니다.
+
+테스트는 다음 명령으로 실행합니다.
+
+```bash
+python -m unittest discover -s tests -v
+```
+
 ## 데이터 및 산출물
 
 `datasets/`는 로컬 및 GPU 서버에 별도로 존재하는 데이터이므로 Git에 포함하지 않습니다. 모델 캐시, 체크포인트, 실행 결과 폴더도 `.gitignore`에서 제외합니다.

@@ -1,0 +1,116 @@
+from __future__ import annotations
+
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+import numpy as np
+
+from aivqa.data import GenerationCollator, QwenVQADataset, TrainCollator
+
+
+class _FakeTokenizer:
+    padding_side = "right"
+
+
+class _FakeProcessor:
+    def __init__(self) -> None:
+        self.tokenizer = _FakeTokenizer()
+        self.calls = []
+
+    def apply_chat_template(self, conversations, **kwargs):
+        self.calls.append((conversations, kwargs))
+        is_batch = bool(conversations and isinstance(conversations[0], list))
+        batch = conversations if is_batch else [conversations]
+        lengths = [5 if chat[-1]["role"] == "assistant" else 4 for chat in batch]
+        width = max(lengths)
+        input_ids = np.zeros((len(batch), width), dtype=np.int64)
+        attention_mask = np.zeros_like(input_ids)
+        for row, length in enumerate(lengths):
+            input_ids[row, :length] = np.arange(1, length + 1)
+            attention_mask[row, :length] = 1
+        return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+
+class DatasetTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        (self.root / "train").mkdir()
+        (self.root / "train" / "mc.jpg").touch()
+        (self.root / "train" / "sa.jpg").touch()
+        records = [
+            {
+                "metadata": {
+                    "question_id": "1",
+                    "split": "train",
+                    "question_form": "MC",
+                },
+                "model_input": {
+                    "image_name": "mc.jpg",
+                    "question": "정답을 고르세요.",
+                    "options": ["1) 첫째", "2) 둘째"],
+                },
+                "model_output": {"answer": "2"},
+            },
+            {
+                "metadata": {
+                    "question_id": "2",
+                    "split": "train",
+                    "question_form": "SA",
+                },
+                "model_input": {
+                    "image_name": "sa.jpg",
+                    "question": "무엇인가요?",
+                    "options": [],
+                },
+                "model_output": {"answer": "정답"},
+            },
+        ]
+        self.json_path = self.root / "annotations.json"
+        self.json_path.write_text(
+            json.dumps(records, ensure_ascii=False), encoding="utf-8"
+        )
+        self.dataset = QwenVQADataset(self.json_path, dataset_root=self.root)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def test_mc_options_are_appended(self) -> None:
+        sample = self.dataset[0]
+        self.assertIn("객관식 (MC)", sample["formatted_question"])
+        self.assertIn("선택지:\n1) 첫째\n2) 둘째", sample["formatted_question"])
+        self.assertEqual(sample["answer"], "2")
+        self.assertEqual([message["role"] for message in sample["messages"]], ["system", "user"])
+
+    def test_empty_options_are_not_rendered(self) -> None:
+        formatted_question = self.dataset[1]["formatted_question"]
+        self.assertNotIn("선택지:", formatted_question)
+        self.assertNotIn("[]", formatted_question)
+
+    def test_train_collator_adds_answer_and_masks_prompt(self) -> None:
+        processor = _FakeProcessor()
+        batch = TrainCollator(processor)([self.dataset[0]])
+        full_conversation = processor.calls[0][0][0]
+        self.assertEqual(full_conversation[-1], {"role": "assistant", "content": "2"})
+        np.testing.assert_array_equal(batch["labels"], [[-100, -100, -100, -100, 5]])
+
+    def test_generation_collator_excludes_answer(self) -> None:
+        processor = _FakeProcessor()
+        batch = GenerationCollator(processor)([self.dataset[0]])
+        conversation = processor.calls[0][0][0]
+        self.assertEqual([message["role"] for message in conversation], ["system", "user"])
+        self.assertNotIn("labels", batch)
+        self.assertTrue(processor.calls[0][1]["add_generation_prompt"])
+
+    def test_train_collator_rejects_missing_answer(self) -> None:
+        processor = _FakeProcessor()
+        sample = self.dataset[0]
+        sample["answer"] = None
+        with self.assertRaisesRegex(ValueError, "Training sample 1"):
+            TrainCollator(processor)([sample])
+
+
+if __name__ == "__main__":
+    unittest.main()
