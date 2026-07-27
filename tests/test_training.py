@@ -10,6 +10,8 @@ from unittest.mock import patch
 from train_lora import (
     DEFAULT_MAX_PIXELS,
     DEFAULT_MIN_PIXELS,
+    _generate_with_retries,
+    _generated_token_count,
     configure_image_pixel_limits,
     create_run_output_dir,
     find_adapter_target_modules,
@@ -38,6 +40,32 @@ class TrainingUtilitiesTest(unittest.TestCase):
         self.assertEqual(args.warmup_ratio, 0.05)
         self.assertEqual(args.early_stopping_patience, 5)
         self.assertEqual(args.gradient_accumulation_steps, 8)
+        self.assertEqual(args.max_new_tokens, 256)
+
+    def test_generated_token_count_ignores_batch_padding(self) -> None:
+        self.assertEqual(_generated_token_count([10, 11, 2, 0, 0], 2, 0), 3)
+        self.assertEqual(_generated_token_count([10, 11, 0, 0], 2, 0), 2)
+        self.assertEqual(_generated_token_count([10, 11, 12], 2, 0), 3)
+
+    def test_generation_retries_original_features_at_most_twice(self) -> None:
+        features = [{"question_id": "1"}, {"question_id": "2"}]
+        calls = []
+
+        def generate_batch(batch_features):
+            calls.append(list(batch_features))
+            if len(calls) == 1:
+                return ["bad\ufffdanswer", "too long"], [5, 256]
+            if len(calls) == 2:
+                return ["fixed", "still too long"], [4, 256]
+            return ["final answer"], [3]
+
+        answers = _generate_with_retries(features, generate_batch, 256)
+
+        self.assertEqual(answers, ["fixed", "final answer"])
+        self.assertEqual([len(call) for call in calls], [2, 2, 1])
+        self.assertIs(calls[1][0], features[0])
+        self.assertIs(calls[1][1], features[1])
+        self.assertIs(calls[2][0], features[1])
 
     def test_each_run_gets_a_unique_timestamped_output_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

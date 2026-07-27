@@ -10,7 +10,7 @@ import re
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 from aivqa.data import GenerationCollator, QwenVQADataset, TrainCollator
 from aivqa.metrics import compute_vqa_metrics
@@ -23,6 +23,7 @@ DATASET_DIR = Path("datasets") / DATASET_NAME
 TEST_PREDICTIONS_NAME = f"{DATASET_NAME}_test_predictions.json"
 EXPECTED_DECODER_LAYERS = 36
 PROJECTION_NAMES = ("q_proj", "k_proj", "v_proj", "o_proj")
+MAX_REGENERATION_ATTEMPTS = 2
 IMAGE_COMPRESSION_FACTOR = 32
 DEFAULT_MIN_PIXELS = 64 * IMAGE_COMPRESSION_FACTOR * IMAGE_COMPRESSION_FACTOR
 DEFAULT_MAX_PIXELS = 512 * IMAGE_COMPRESSION_FACTOR * IMAGE_COMPRESSION_FACTOR
@@ -70,7 +71,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-ratio", type=float, default=0.05)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--early-stopping-patience", type=int, default=5)
-    parser.add_argument("--max-new-tokens", type=int, default=128)
+    parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -406,6 +407,53 @@ def _feature_batches(dataset: QwenVQADataset, batch_size: int) -> Iterable[list[
         yield [dataset[index] for index in range(start, min(start + batch_size, len(dataset)))]
 
 
+def _generated_token_count(
+    token_ids: Sequence[int],
+    eos_token_id: int | Sequence[int] | None,
+    pad_token_id: int | None,
+) -> int:
+    eos_token_ids = (
+        set(eos_token_id)
+        if isinstance(eos_token_id, (list, tuple, set))
+        else {eos_token_id}
+        if eos_token_id is not None
+        else set()
+    )
+    for index, token_id in enumerate(token_ids):
+        if token_id in eos_token_ids:
+            return index + 1
+        if pad_token_id is not None and token_id == pad_token_id:
+            return index
+    return len(token_ids)
+
+
+def _generate_with_retries(
+    features: Sequence[dict[str, Any]],
+    generate_batch: Callable[
+        [Sequence[dict[str, Any]]], tuple[list[str], list[int]]
+    ],
+    max_new_tokens: int,
+) -> list[str]:
+    answers, token_counts = generate_batch(features)
+    for _ in range(MAX_REGENERATION_ATTEMPTS):
+        retry_indices = [
+            index
+            for index, (answer, token_count) in enumerate(zip(answers, token_counts))
+            if "\ufffd" in answer or token_count >= max_new_tokens
+        ]
+        if not retry_indices:
+            break
+
+        retry_features = [features[index] for index in retry_indices]
+        retry_answers, retry_token_counts = generate_batch(retry_features)
+        for index, answer, token_count in zip(
+            retry_indices, retry_answers, retry_token_counts
+        ):
+            answers[index] = answer
+            token_counts[index] = token_count
+    return answers
+
+
 def generate_predictions(
     model: Any,
     processor: Any,
@@ -425,13 +473,10 @@ def generate_predictions(
     total_batches = math.ceil(len(dataset) / batch_size)
     try:
         with torch.inference_mode():
-            for features in tqdm(
-                _feature_batches(dataset, batch_size),
-                total=total_batches,
-                desc="generate",
-                leave=False,
-            ):
-                batch = collator(features)
+            def generate_batch(
+                features_to_generate: Sequence[dict[str, Any]],
+            ) -> tuple[list[str], list[int]]:
+                batch = collator(features_to_generate)
                 prompt_width = batch["input_ids"].shape[1]
                 batch = _move_batch_to_model(batch, model)
                 with _autocast(dtype):
@@ -445,13 +490,32 @@ def generate_predictions(
                         eos_token_id=processor.tokenizer.eos_token_id,
                     )
                 answer_ids = generated_ids[:, prompt_width:].detach().cpu()
-                predictions.extend(
+                answers = [
                     answer.strip()
                     for answer in processor.batch_decode(
                         answer_ids,
                         skip_special_tokens=True,
                         clean_up_tokenization_spaces=False,
                     )
+                ]
+                token_counts = [
+                    _generated_token_count(
+                        token_ids.tolist(),
+                        processor.tokenizer.eos_token_id,
+                        processor.tokenizer.pad_token_id,
+                    )
+                    for token_ids in answer_ids
+                ]
+                return answers, token_counts
+
+            for features in tqdm(
+                _feature_batches(dataset, batch_size),
+                total=total_batches,
+                desc="generate",
+                leave=False,
+            ):
+                predictions.extend(
+                    _generate_with_retries(features, generate_batch, max_new_tokens)
                 )
     finally:
         processor.tokenizer.padding_side = previous_padding_side
