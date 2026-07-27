@@ -24,6 +24,15 @@ class _FakeProcessor:
         self.calls.append((conversations, kwargs))
         is_batch = bool(conversations and isinstance(conversations[0], list))
         batch = conversations if is_batch else [conversations]
+        for chat in batch:
+            for message in chat:
+                if not isinstance(message["content"], list):
+                    raise TypeError("processor message content must be a list")
+                if not all(
+                    isinstance(item, dict) and "type" in item
+                    for item in message["content"]
+                ):
+                    raise TypeError("processor content items must be typed dictionaries")
         lengths = [5 if chat[-1]["role"] == "assistant" else 4 for chat in batch]
         width = max(lengths)
         input_ids = np.zeros((len(batch), width), dtype=np.int64)
@@ -90,6 +99,7 @@ class DatasetTest(unittest.TestCase):
         self.assertIn("선택지:\n1) 첫째\n2) 둘째", sample["formatted_question"])
         self.assertEqual(sample["answer"], "2")
         self.assertEqual([message["role"] for message in sample["messages"]], ["system", "user"])
+        self.assertIsInstance(sample["messages"][0]["content"], str)
 
     def test_empty_options_are_not_rendered(self) -> None:
         sample = self.dataset[1]
@@ -117,7 +127,14 @@ class DatasetTest(unittest.TestCase):
         processor = _FakeProcessor()
         batch = TrainCollator(processor)([self.dataset[0]])
         full_conversation = processor.calls[0][0][0]
-        self.assertEqual(full_conversation[-1], {"role": "assistant", "content": "2"})
+        self.assertEqual(
+            full_conversation[-1],
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "2"}],
+            },
+        )
+        self.assertEqual(full_conversation[0]["content"][0]["type"], "text")
         np.testing.assert_array_equal(batch["labels"], [[-100, -100, -100, -100, 5]])
 
     def test_generation_collator_excludes_answer(self) -> None:
@@ -125,6 +142,10 @@ class DatasetTest(unittest.TestCase):
         batch = GenerationCollator(processor)([self.dataset[0]])
         conversation = processor.calls[0][0][0]
         self.assertEqual([message["role"] for message in conversation], ["system", "user"])
+        self.assertEqual(conversation[0]["content"][0]["type"], "text")
+        self.assertTrue(
+            all(isinstance(message["content"], list) for message in conversation)
+        )
         self.assertNotIn("labels", batch)
         self.assertTrue(processor.calls[0][1]["add_generation_prompt"])
 

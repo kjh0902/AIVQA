@@ -180,13 +180,19 @@ def _prompt_messages(feature: dict[str, Any]) -> list[dict[str, Any]]:
     if any(message.get("role") == "assistant" for message in messages):
         raise ValueError("Dataset messages must contain only the system/user prompt")
 
-    # Copy the message containers without duplicating the potentially large PIL image.
+    # Multimodal processors expect every content value to be a list of typed
+    # items. Normalize string content only at collation time so the Dataset can
+    # retain the requested Qwen messages representation.
     copied_messages = []
     for message in messages:
         copied_message = dict(message)
         content = message.get("content")
-        if isinstance(content, list):
+        if isinstance(content, str):
+            copied_message["content"] = [{"type": "text", "text": content}]
+        elif isinstance(content, list):
             copied_message["content"] = [dict(item) for item in content]
+        else:
+            raise ValueError("Each message content must be a string or a list")
         copied_messages.append(copied_message)
     return copied_messages
 
@@ -214,7 +220,15 @@ class TrainCollator:
                 )
             prompt_conversations.append(prompt)
             full_conversations.append(
-                prompt + [{"role": "assistant", "content": str(answer).strip()}]
+                prompt
+                + [
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": str(answer).strip()}
+                        ],
+                    }
+                ]
             )
 
         batch = self.processor.apply_chat_template(
