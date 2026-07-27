@@ -22,6 +22,9 @@ DATASET_DIR = Path("datasets") / DATASET_NAME
 TEST_PREDICTIONS_NAME = f"{DATASET_NAME}_test_predictions.json"
 EXPECTED_DECODER_LAYERS = 36
 PROJECTION_NAMES = ("q_proj", "k_proj", "v_proj", "o_proj")
+IMAGE_COMPRESSION_FACTOR = 32
+DEFAULT_MIN_PIXELS = 64 * IMAGE_COMPRESSION_FACTOR * IMAGE_COMPRESSION_FACTOR
+DEFAULT_MAX_PIXELS = 512 * IMAGE_COMPRESSION_FACTOR * IMAGE_COMPRESSION_FACTOR
 TARGET_PATTERN = re.compile(
     r"^model\.language_model\.layers\.(\d+)\.self_attn\."
     r"(q_proj|k_proj|v_proj|o_proj)$"
@@ -64,6 +67,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--min-pixels",
+        type=int,
+        default=DEFAULT_MIN_PIXELS,
+        help="Minimum pixels per image before Qwen3-VL processing",
+    )
+    parser.add_argument(
+        "--max-pixels",
+        type=int,
+        default=DEFAULT_MAX_PIXELS,
+        help="Maximum pixels per image before Qwen3-VL processing",
+    )
 
     # Adapter defaults are kept together here so they are easy to modify.
     parser.add_argument("--lora-r", type=int, default=16)
@@ -119,6 +134,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("learning rate and max grad norm must be positive")
     if args.num_workers < 0:
         raise ValueError("--num-workers cannot be negative")
+    if args.min_pixels < 1 or args.max_pixels < 1:
+        raise ValueError("--min-pixels and --max-pixels must be positive")
+    if args.max_pixels < args.min_pixels:
+        raise ValueError("--max-pixels must be greater than or equal to --min-pixels")
 
 
 def set_seed(seed: int) -> None:
@@ -168,6 +187,20 @@ def _torch_dtype(name: str) -> Any:
     return getattr(torch, name)
 
 
+def configure_image_pixel_limits(
+    processor: Any, min_pixels: int, max_pixels: int
+) -> None:
+    """Set one shared image pixel budget on the official Qwen3-VL processor."""
+    if not hasattr(processor, "image_processor"):
+        raise TypeError("The loaded processor does not expose an image_processor")
+    if min_pixels < 1 or max_pixels < min_pixels:
+        raise ValueError("Expected 0 < min_pixels <= max_pixels")
+    processor.image_processor.size = {
+        "shortest_edge": int(min_pixels),
+        "longest_edge": int(max_pixels),
+    }
+
+
 def build_model_and_processor(args: argparse.Namespace) -> tuple[Any, Any, Any]:
     import torch
     from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
@@ -178,6 +211,7 @@ def build_model_and_processor(args: argparse.Namespace) -> tuple[Any, Any, Any]:
 
     dtype = _torch_dtype(args.dtype)
     processor = AutoProcessor.from_pretrained(args.model_id)
+    configure_image_pixel_limits(processor, args.min_pixels, args.max_pixels)
     if processor.tokenizer.pad_token_id is None:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
     processor.tokenizer.padding_side = "right"
@@ -196,6 +230,11 @@ def build_model_and_processor(args: argparse.Namespace) -> tuple[Any, Any, Any]:
             bnb_4bit_compute_dtype=dtype,
         )
 
+    print(
+        f"Image pixel budget: min={args.min_pixels:,}, max={args.max_pixels:,} "
+        f"(~{args.min_pixels // IMAGE_COMPRESSION_FACTOR**2}-"
+        f"{args.max_pixels // IMAGE_COMPRESSION_FACTOR**2} visual tokens)"
+    )
     print(f"Loading processor and model: {args.model_id}")
     model = Qwen3VLForConditionalGeneration.from_pretrained(
         args.model_id, **model_kwargs
@@ -502,6 +541,8 @@ def main() -> int:
         args.validation_json, dataset_root=args.dataset_root
     )
     test_dataset = QwenVQADataset(args.test_json, dataset_root=args.dataset_root)
+    # The same configured processor instance is shared by every train/validation/test
+    # collator, so all image inputs use exactly the same pixel limits.
     model, processor, dtype = build_model_and_processor(args)
 
     train_loader = DataLoader(

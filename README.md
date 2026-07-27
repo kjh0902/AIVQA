@@ -131,6 +131,20 @@ python train_lora.py \
   --gradient-accumulation-steps 8
 ```
 
+모든 train/validation/test 이미지에는 동일한 processor pixel 제한이 적용됩니다. Qwen3-VL의 32×32 spatial compression을 기준으로 기본 범위는 약 64~512 visual tokens입니다.
+
+- `--min-pixels 65536` (`64 × 32 × 32`)
+- `--max-pixels 524288` (`512 × 32 × 32`)
+
+첫 배치에서 여전히 CUDA OOM이 발생하면 최대치를 약 256 visual tokens로 더 낮출 수 있습니다.
+
+```bash
+python train_lora.py \
+  --load-in-4bit \
+  --min-pixels 65536 \
+  --max-pixels 262144
+```
+
 기본 adapter는 LoRA이며 `r=16`, `alpha=32`, `dropout=0.05`입니다. DoRA는 `--use-dora`를 추가합니다.
 
 ```bash

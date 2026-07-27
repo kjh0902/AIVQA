@@ -5,10 +5,42 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from train_lora import find_adapter_target_modules, save_test_predictions
+from train_lora import (
+    DEFAULT_MAX_PIXELS,
+    DEFAULT_MIN_PIXELS,
+    configure_image_pixel_limits,
+    find_adapter_target_modules,
+    save_test_predictions,
+)
+
+
+class _FakeImageProcessor:
+    size = {"shortest_edge": 1, "longest_edge": 2}
+
+
+class _FakeProcessor:
+    def __init__(self) -> None:
+        self.image_processor = _FakeImageProcessor()
 
 
 class TrainingUtilitiesTest(unittest.TestCase):
+    def test_default_pixel_budget_is_applied_to_processor(self) -> None:
+        processor = _FakeProcessor()
+        configure_image_pixel_limits(
+            processor, DEFAULT_MIN_PIXELS, DEFAULT_MAX_PIXELS
+        )
+        self.assertEqual(
+            processor.image_processor.size,
+            {
+                "shortest_edge": 64 * 32 * 32,
+                "longest_edge": 512 * 32 * 32,
+            },
+        )
+
+    def test_invalid_pixel_budget_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            configure_image_pixel_limits(_FakeProcessor(), 200, 100)
+
     def test_exactly_144_language_attention_targets_are_selected(self) -> None:
         names = [
             f"model.language_model.layers.{layer}.self_attn.{projection}"
