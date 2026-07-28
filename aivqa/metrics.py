@@ -18,10 +18,10 @@ def _tokenize(text: str) -> list[str]:
     return re.findall(r"\w+|[^\w\s]", _normalize_text(text), flags=re.UNICODE)
 
 
-def _normalize_mc_answer(text: str) -> str:
+def _normalize_mc_answer(text: str) -> tuple[str, ...] | str:
     normalized = _normalize_text(text)
-    match = re.search(r"(?<!\d)([1-5])(?!\d)", normalized)
-    return match.group(1) if match else normalized
+    choices = re.findall(r"(?<!\d)([1-5])(?!\d)", normalized)
+    return tuple(sorted(set(choices))) if choices else normalized
 
 
 def _rouge_l_f1(prediction: str, reference: str) -> float:

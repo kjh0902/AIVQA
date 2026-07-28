@@ -23,6 +23,14 @@ class MetricsTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             compute_vqa_metrics(["1"], [], ["MC"])
 
+    def test_mc_compares_the_complete_choice_set(self) -> None:
+        metrics = compute_vqa_metrics(
+            predictions=["1/3", "5/1", "정답은 1번과 5번입니다."],
+            references=["1/5", "1/5", "1/5"],
+            question_forms=["MC", "MC", "MC"],
+        )
+        self.assertAlmostEqual(metrics["mc_accuracy"], 2.0 / 3.0)
+
     def test_final_score_uses_the_three_requested_components(self) -> None:
         metrics = compute_vqa_metrics(
             predictions=["1", "오답", "정답", "오답", "동일 문장"],
