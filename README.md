@@ -109,6 +109,7 @@ generation_loader = DataLoader(
 - `TrainCollator`: assistant 정답을 messages에 추가하고, prompt와 padding 위치를 `-100`으로 마스킹한 `labels`를 만듭니다.
 - `GenerationCollator`: assistant 정답을 제외하고 generation prompt까지 추가합니다.
 - MC 선택지는 원본 순서를 유지하여 질문 아래에 붙이며, SA/LA의 빈 선택지 배열은 출력하지 않습니다.
+- MC/SA/LA별 답변 형식 instruction은 train, validation, test에서 동일하게 적용됩니다.
 
 테스트는 다음 명령으로 실행합니다.
 

@@ -21,6 +21,21 @@ QUESTION_FORM_LABELS = {
     "LA": "서술형",
 }
 
+QUESTION_FORM_INSTRUCTIONS = {
+    "MC": (
+        "선택지 번호만 출력하세요. 복수 정답이면 번호를 오름차순으로 정렬하여 "
+        "'/'로 구분하세요. 설명이나 다른 문장은 출력하지 마세요."
+    ),
+    "SA": (
+        "질문에서 요구한 음절 수, 어절 수, 답의 개수를 정확히 지키고 정답만 "
+        "출력하세요. 설명이나 부가 문장은 출력하지 마세요."
+    ),
+    "LA": (
+        "250자 이내의 한 문단으로 답하세요. 같은 내용을 반복하지 말고, 이미지와 "
+        "질문에 필요한 내용만 구체적으로 서술하세요."
+    ),
+}
+
 
 def format_question(question_form: str, question: str, options: Sequence[str]) -> str:
     """Combine the question form, question, and non-empty options."""
@@ -99,8 +114,11 @@ class QwenVQADataset:
         image = self._load_rgb_image(image_path, index)
 
         formatted_question = format_question(question_form, question, options)
+        instruction_prompt = (
+            f"{self.system_prompt}\n\n{QUESTION_FORM_INSTRUCTIONS[question_form]}"
+        )
         prompt_messages = [
-            {"role": "system", "content": self.system_prompt},
+            {"role": "system", "content": instruction_prompt},
             {
                 "role": "user",
                 "content": [

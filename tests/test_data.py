@@ -55,6 +55,9 @@ class DatasetTest(unittest.TestCase):
         Image.new("RGBA", (8, 8), color=(0, 255, 0, 128)).save(
             self.root / "train" / "sa.jpg", format="TIFF"
         )
+        Image.new("RGB", (8, 8), color=(0, 0, 255)).save(
+            self.root / "train" / "la.jpg", format="JPEG"
+        )
         self.original_tiff_bytes = (self.root / "train" / "sa.jpg").read_bytes()
         records = [
             {
@@ -82,6 +85,19 @@ class DatasetTest(unittest.TestCase):
                     "options": [],
                 },
                 "model_output": {"answer": "정답"},
+            },
+            {
+                "metadata": {
+                    "question_id": "3",
+                    "split": "train",
+                    "question_form": "LA",
+                },
+                "model_input": {
+                    "image_name": "la.jpg",
+                    "question": "내용을 서술하세요.",
+                    "options": [],
+                },
+                "model_output": {"answer": "서술형 정답입니다."},
             },
         ]
         self.json_path = self.root / "annotations.json"
@@ -114,6 +130,25 @@ class DatasetTest(unittest.TestCase):
         self.assertEqual(
             (self.root / "train" / "sa.jpg").read_bytes(), self.original_tiff_bytes
         )
+
+    def test_question_form_specific_instructions_are_used_by_both_collators(self) -> None:
+        samples = [self.dataset[index] for index in range(3)]
+        prompts = [sample["messages"][0]["content"] for sample in samples]
+
+        self.assertIn("오름차순", prompts[0])
+        self.assertIn("음절 수, 어절 수, 답의 개수", prompts[1])
+        self.assertIn("250자 이내의 한 문단", prompts[2])
+        self.assertEqual(len(set(prompts)), 3)
+
+        for collator_type in (TrainCollator, GenerationCollator):
+            processor = _FakeProcessor()
+            collator_type(processor)(samples)
+            conversations = processor.calls[0][0]
+            collated_prompts = [
+                conversation[0]["content"][0]["text"]
+                for conversation in conversations
+            ]
+            self.assertEqual(collated_prompts, prompts)
 
     def test_message_copy_reuses_in_memory_image(self) -> None:
         sample = self.dataset[0]
