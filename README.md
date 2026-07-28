@@ -117,6 +117,29 @@ generation_loader = DataLoader(
 python -m unittest discover -s tests -v
 ```
 
+## Pretrained zero-shot Test JSON 생성
+
+LoRA/DoRA adapter를 적용하지 않은 pretrained Qwen3-VL로 Test 답변 JSON을
+생성합니다. Dataset의 MC/SA/LA별 instruction, 이미지 pixel 제한, greedy
+generation 설정은 학습 후 Test 생성과 동일합니다.
+
+```bash
+conda activate aivqa
+python generate_zero_shot.py --load-in-4bit
+```
+
+기본 결과는 실행마다 다음 경로에 별도로 저장됩니다.
+
+```text
+outputs/qwen3_vl_zero_shot/run_YYYYMMDD_HHMMSS/
+└── 한국문화 멀티모달 질의응답_test_predictions_zero_shot.json
+```
+
+원본 Test JSON의 순서와 기존 필드는 유지하고 `model_output.answer`만 채우며,
+원본 파일은 덮어쓰지 않습니다. 비교 실험에서는 LoRA 학습 때 사용한 4-bit
+여부와 `--min-pixels`, `--max-pixels`, `--max-new-tokens` 값을 동일하게 지정해야
+합니다.
+
 ## LoRA/DoRA 학습·검증·테스트
 
 `train_lora.py`는 36개 language decoder layer의 `q_proj`, `k_proj`, `v_proj`, `o_proj`에만 adapter를 적용합니다. Vision encoder, visual merger, LM head와 decoder의 원본 가중치는 모두 frozen 상태로 유지하며, 실행 시 대상 projection 144개와 trainable parameter 범위를 검사합니다.
