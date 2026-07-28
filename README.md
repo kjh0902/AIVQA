@@ -140,6 +140,20 @@ outputs/qwen3_vl_zero_shot/run_YYYYMMDD_HHMMSS/
 여부와 `--min-pixels`, `--max-pixels`, `--max-new-tokens` 값을 동일하게 지정해야
 합니다.
 
+## 전체 이미지 pixel 분석
+
+모델을 로드하지 않고 train, validation, test JSON의 `model_input.image_name`을
+따라 모든 이미지의 표시 방향 기준 width, height, pixel 수를 분석합니다.
+
+```bash
+conda activate aivqa
+python analyze_image_pixels.py
+```
+
+결과는 `outputs/image_pixel_analysis/run_YYYYMMDD_HHMMSS/` 아래에 이미지별
+CSV, split/전체 요약 CSV·JSON·TXT와 pixel 분포, 상한 비교, 이미지 크기 PNG
+그래프로 저장됩니다. CSV는 `utf-8-sig`, JSON과 TXT는 UTF-8 인코딩입니다.
+
 ## LoRA/DoRA 학습·검증·테스트
 
 `train_lora.py`는 36개 language decoder layer의 `q_proj`, `k_proj`, `v_proj`, `o_proj`에만 adapter를 적용합니다. Vision encoder, visual merger, LM head와 decoder의 원본 가중치는 모두 frozen 상태로 유지하며, 실행 시 대상 projection 144개와 trainable parameter 범위를 검사합니다.
