@@ -28,15 +28,15 @@ class _FakeProcessor:
 
 
 class TrainingUtilitiesTest(unittest.TestCase):
-    def test_longer_training_defaults(self) -> None:
+    def test_shorter_training_defaults(self) -> None:
         with patch("sys.argv", ["train_lora.py"]):
             args = parse_args()
 
-        self.assertEqual(args.epochs, 20)
+        self.assertEqual(args.epochs, 5)
         self.assertEqual(args.num_workers, 2)
-        self.assertEqual(args.learning_rate, 1e-4)
-        self.assertEqual(args.warmup_ratio, 0.05)
-        self.assertEqual(args.early_stopping_patience, 5)
+        self.assertEqual(args.learning_rate, 5e-5)
+        self.assertEqual(args.warmup_ratio, 0.10)
+        self.assertEqual(args.early_stopping_patience, 2)
         self.assertEqual(args.gradient_accumulation_steps, 8)
 
     def test_each_run_gets_a_unique_timestamped_output_directory(self) -> None:
@@ -61,7 +61,7 @@ class TrainingUtilitiesTest(unittest.TestCase):
             processor.image_processor.size,
             {
                 "shortest_edge": 64 * 32 * 32,
-                "longest_edge": 512 * 32 * 32,
+                "longest_edge": 1024 * 32 * 32,
             },
         )
 

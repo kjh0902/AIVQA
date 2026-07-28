@@ -126,32 +126,32 @@ RTX 5070처럼 VRAM이 제한된 GPU에서는 frozen base model을 4-bit로 로�
 conda activate aivqa
 python train_lora.py \
   --load-in-4bit \
-  --epochs 20 \
-  --learning-rate 1e-4 \
-  --warmup-ratio 0.05 \
-  --early-stopping-patience 5 \
+  --epochs 5 \
+  --learning-rate 5e-5 \
+  --warmup-ratio 0.10 \
+  --early-stopping-patience 2 \
   --train-batch-size 1 \
   --eval-batch-size 1 \
   --gradient-accumulation-steps 8 \
   --num-workers 2
 ```
 
-20 epoch 학습을 기준으로 기본 learning rate는 `1e-4`, warmup ratio는 `0.05`,
-early stopping patience는 `5`입니다. 배치 크기와 gradient accumulation 기본값은
+5 epoch 학습을 기준으로 기본 learning rate는 `5e-5`, warmup ratio는 `0.10`,
+early stopping patience는 `2`입니다. 배치 크기와 gradient accumulation 기본값은
 VRAM 사용량이 증가하지 않도록 각각 `1`, `1`, `8`을 유지합니다.
 
-모든 train/validation/test 이미지에는 동일한 processor pixel 제한이 적용됩니다. Qwen3-VL의 32×32 spatial compression을 기준으로 기본 범위는 약 64~512 visual tokens입니다.
+모든 train/validation/test 이미지에는 동일한 processor pixel 제한이 적용됩니다. Qwen3-VL의 32×32 spatial compression을 기준으로 기본 범위는 약 64~1024 visual tokens입니다.
 
 - `--min-pixels 65536` (`64 × 32 × 32`)
-- `--max-pixels 524288` (`512 × 32 × 32`)
+- `--max-pixels 1048576` (`1024 × 32 × 32`)
 
-첫 배치에서 여전히 CUDA OOM이 발생하면 최대치를 약 256 visual tokens로 더 낮출 수 있습니다.
+첫 배치에서 CUDA OOM이 발생하면 최대치를 약 512 visual tokens로 낮출 수 있습니다.
 
 ```bash
 python train_lora.py \
   --load-in-4bit \
   --min-pixels 65536 \
-  --max-pixels 262144
+  --max-pixels 524288
 ```
 
 기본 adapter는 LoRA이며 `r=16`, `alpha=32`, `dropout=0.05`입니다. DoRA는 `--use-dora`를 추가합니다.

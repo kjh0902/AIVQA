@@ -25,7 +25,7 @@ EXPECTED_DECODER_LAYERS = 36
 PROJECTION_NAMES = ("q_proj", "k_proj", "v_proj", "o_proj")
 IMAGE_COMPRESSION_FACTOR = 32
 DEFAULT_MIN_PIXELS = 64 * IMAGE_COMPRESSION_FACTOR * IMAGE_COMPRESSION_FACTOR
-DEFAULT_MAX_PIXELS = 512 * IMAGE_COMPRESSION_FACTOR * IMAGE_COMPRESSION_FACTOR
+DEFAULT_MAX_PIXELS = 1024 * IMAGE_COMPRESSION_FACTOR * IMAGE_COMPRESSION_FACTOR
 TARGET_PATTERN = re.compile(
     r"^model\.language_model\.layers\.(\d+)\.self_attn\."
     r"(q_proj|k_proj|v_proj|o_proj)$"
@@ -61,15 +61,15 @@ def parse_args() -> argparse.Namespace:
         help="Default: RUN_OUTPUT_DIR/한국문화 멀티모달 질의응답_test_predictions.json",
     )
 
-    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--train-batch-size", type=int, default=1)
     parser.add_argument("--eval-batch-size", type=int, default=1)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
-    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--learning-rate", type=float, default=5e-5)
     parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--warmup-ratio", type=float, default=0.05)
+    parser.add_argument("--warmup-ratio", type=float, default=0.10)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
-    parser.add_argument("--early-stopping-patience", type=int, default=5)
+    parser.add_argument("--early-stopping-patience", type=int, default=2)
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
