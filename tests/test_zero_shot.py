@@ -10,7 +10,7 @@ from generate_zero_shot import (
     parse_args,
     validate_args,
 )
-from train_lora import parse_args as parse_training_args
+from train_lora import DEFAULT_MAX_PIXELS, parse_args as parse_training_args
 
 
 class ZeroShotUtilitiesTest(unittest.TestCase):
@@ -48,6 +48,24 @@ class ZeroShotUtilitiesTest(unittest.TestCase):
             ):
                 args = parse_args()
             with self.assertRaisesRegex(ValueError, "eval-batch-size"):
+                validate_args(args)
+
+    def test_max_pixels_cannot_exceed_training_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            test_json = Path(temp_dir) / "test.json"
+            test_json.write_text("[]", encoding="utf-8")
+            with patch(
+                "sys.argv",
+                [
+                    "generate_zero_shot.py",
+                    "--test-json",
+                    str(test_json),
+                    "--max-pixels",
+                    str(DEFAULT_MAX_PIXELS + 1),
+                ],
+            ):
+                args = parse_args()
+            with self.assertRaisesRegex(ValueError, "DEFAULT_MAX_PIXELS"):
                 validate_args(args)
 
 

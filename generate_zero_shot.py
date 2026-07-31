@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from aivqa.data import QwenVQADataset
+from aivqa.text_crops import TextCropDataset, build_text_detector
 from train_lora import (
     DATASET_DIR,
     DATASET_NAME,
@@ -75,6 +76,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-new-tokens must be at least 1")
     if args.min_pixels < 1 or args.max_pixels < args.min_pixels:
         raise ValueError("Expected 0 < min_pixels <= max_pixels")
+    if args.max_pixels > DEFAULT_MAX_PIXELS:
+        raise ValueError(
+            f"--max-pixels cannot exceed DEFAULT_MAX_PIXELS ({DEFAULT_MAX_PIXELS})"
+        )
 
 
 def build_pretrained_model_and_processor(args: argparse.Namespace) -> tuple[Any, Any, Any]:
@@ -135,7 +140,10 @@ def main() -> int:
     )
     print(f"Run output directory: {run_output_dir}")
 
-    dataset = QwenVQADataset(args.test_json, dataset_root=args.dataset_root)
+    base_dataset = QwenVQADataset(args.test_json, dataset_root=args.dataset_root)
+    print("Loading PP-OCRv5_server_det on CPU with MKLDNN disabled")
+    text_detector = build_text_detector()
+    dataset = TextCropDataset(base_dataset, text_detector, args.max_pixels)
     model, processor, dtype = build_pretrained_model_and_processor(args)
     predictions = generate_predictions(
         model,

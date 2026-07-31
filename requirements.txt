@@ -10,3 +10,5 @@ peft>=0.17.0,<1.0.0
 matplotlib>=3.8.0,<4.0.0
 tqdm>=4.66.0,<5.0.0
 bitsandbytes>=0.46.0,<1.0.0; platform_system == "Linux"
+# Keep the existing paddlepaddle-gpu 3.3.0 CUDA build installed from Paddle's index.
+paddleocr>=3.3.2,<3.4.0
