@@ -126,12 +126,17 @@ def create_ocr() -> PaddleOCR:
     try:
         return PaddleOCR(
             lang="korean",
+            enable_mkldnn=False,
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
             use_textline_orientation=False,
         )
     except TypeError:
-        return PaddleOCR(lang="korean", use_angle_cls=True)
+        return PaddleOCR(
+            lang="korean",
+            use_angle_cls=True,
+            enable_mkldnn=False,
+        )
 
 
 def run_ocr(ocr: PaddleOCR, image_array: np.ndarray) -> list[OCRItem]:
