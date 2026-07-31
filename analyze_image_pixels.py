@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 import warnings
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +17,7 @@ from train_lora import (
     DEFAULT_MAX_PIXELS,
     DEFAULT_MIN_PIXELS,
     IMAGE_COMPRESSION_FACTOR,
+    create_run_output_dir as create_output_dir,
 )
 
 
@@ -85,21 +85,6 @@ def validate_args(args: argparse.Namespace) -> None:
             raise FileNotFoundError(f"Dataset JSON does not exist: {path}")
     if args.min_pixels < 1 or args.max_pixels < args.min_pixels:
         raise ValueError("Expected 0 < min_pixels <= max_pixels")
-
-
-def create_output_dir(output_root: Path, started_at: datetime | None = None) -> Path:
-    output_root.mkdir(parents=True, exist_ok=True)
-    timestamp = (started_at or datetime.now()).strftime("%Y%m%d_%H%M%S")
-    base_name = f"run_{timestamp}"
-    suffix = 0
-    while True:
-        name = base_name if suffix == 0 else f"{base_name}_{suffix:02d}"
-        output_dir = output_root / name
-        try:
-            output_dir.mkdir(exist_ok=False)
-            return output_dir
-        except FileExistsError:
-            suffix += 1
 
 
 def resolve_image_path(dataset_root: Path, split: str, image_name: str) -> Path:

@@ -48,13 +48,6 @@ class TrainingLogger:
             self._write_json(self.output_dir / "best_metrics.json", record)
         self._write_plots()
 
-    def finalize(self) -> None:
-        if not self.history:
-            return
-        self._write_history_json()
-        self._write_history_csv()
-        self._write_plots()
-
     def _write_history_json(self) -> None:
         self._write_json(self.output_dir / "training_history.json", self.history)
 

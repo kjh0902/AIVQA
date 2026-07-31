@@ -206,12 +206,6 @@ def find_adapter_target_modules(module_names: Iterable[str]) -> list[str]:
     return sorted(targets)
 
 
-def _torch_dtype(name: str) -> Any:
-    import torch
-
-    return getattr(torch, name)
-
-
 def configure_image_pixel_limits(
     processor: Any, min_pixels: int, max_pixels: int
 ) -> None:
@@ -234,7 +228,7 @@ def build_model_and_processor(args: argparse.Namespace) -> tuple[Any, Any, Any]:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA GPU is required for Qwen3-VL-8B training")
 
-    dtype = _torch_dtype(args.dtype)
+    dtype = getattr(torch, args.dtype)
     processor = AutoProcessor.from_pretrained(args.model_id)
     configure_image_pixel_limits(processor, args.min_pixels, args.max_pixels)
     if processor.tokenizer.pad_token_id is None:
@@ -326,12 +320,6 @@ def _move_batch_to_model(batch: Any, model: Any) -> Any:
     }
 
 
-def _autocast(dtype: Any) -> Any:
-    import torch
-
-    return torch.autocast(device_type="cuda", dtype=dtype)
-
-
 def train_one_epoch(
     model: Any,
     loader: Any,
@@ -357,7 +345,7 @@ def train_one_epoch(
         group_start = (step // gradient_accumulation_steps) * gradient_accumulation_steps
         group_size = min(gradient_accumulation_steps, len(loader) - group_start)
 
-        with _autocast(dtype):
+        with torch.autocast(device_type="cuda", dtype=dtype):
             outputs = model(**batch, use_cache=False)
             loss = outputs.loss
         scaler.scale(loss / group_size).backward()
@@ -392,7 +380,7 @@ def evaluate_loss(model: Any, loader: Any, dtype: Any) -> float:
         for batch in loader:
             batch = _move_batch_to_model(batch, model)
             target_tokens = int((batch["labels"] != -100).sum().item())
-            with _autocast(dtype):
+            with torch.autocast(device_type="cuda", dtype=dtype):
                 loss = model(**batch, use_cache=False).loss
             loss_sum += float(loss.item()) * target_tokens
             token_count += target_tokens
@@ -434,7 +422,7 @@ def generate_predictions(
                 batch = collator(features)
                 prompt_width = batch["input_ids"].shape[1]
                 batch = _move_batch_to_model(batch, model)
-                with _autocast(dtype):
+                with torch.autocast(device_type="cuda", dtype=dtype):
                     generated_ids = model.generate(
                         **batch,
                         max_new_tokens=max_new_tokens,
@@ -673,7 +661,6 @@ def main() -> int:
             )
             break
 
-    logger.finalize()
     checkpoint = load_best_checkpoint(model, best_checkpoint_path)
     print(
         f"Loaded best epoch {checkpoint['epoch']} "
