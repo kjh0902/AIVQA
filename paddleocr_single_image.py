@@ -38,6 +38,11 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="결과 이미지 경로 (기본값: 입력파일명_paddleocr_boxes.png)",
     )
+    parser.add_argument(
+        "--device",
+        default="gpu:0",
+        help="PaddleOCR 추론 장치 (기본값: gpu:0, CPU 사용 시: cpu)",
+    )
     return parser.parse_args()
 
 
@@ -121,22 +126,58 @@ def _parse_legacy_results(results: Any) -> list[OCRItem]:
     return items
 
 
-def create_ocr() -> PaddleOCR:
+def validate_device(device: str) -> None:
+    """Fail early with a useful message when the requested GPU is unavailable."""
+    normalized = device.lower()
+    if not normalized.startswith("gpu"):
+        return
+
+    import paddle
+
+    if not paddle.is_compiled_with_cuda():
+        raise SystemExit(
+            "현재 환경의 PaddlePaddle이 CUDA를 지원하지 않습니다. "
+            "CPU용 `paddlepaddle` 대신 CUDA 버전에 맞는 "
+            "`paddlepaddle-gpu`를 설치하세요."
+        )
+
+    try:
+        gpu_index = int(normalized.split(":", maxsplit=1)[1])
+    except IndexError:
+        gpu_index = 0
+    except ValueError as exc:
+        raise SystemExit(f"잘못된 GPU 장치 형식입니다: {device}") from exc
+
+    gpu_count = paddle.device.cuda.device_count()
+    if gpu_index < 0 or gpu_index >= gpu_count:
+        raise SystemExit(
+            f"요청한 장치 {device}를 사용할 수 없습니다. "
+            f"PaddlePaddle이 감지한 GPU 수: {gpu_count}"
+        )
+
+
+def create_ocr(device: str) -> PaddleOCR:
     """Create a Korean OCR pipeline, with a fallback for PaddleOCR 2.x."""
     try:
-        return PaddleOCR(
-            lang="korean",
-            enable_mkldnn=False,
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
-            use_textline_orientation=False,
-        )
+        options: dict[str, Any] = {
+            "device": device,
+            "lang": "korean",
+            "use_doc_orientation_classify": False,
+            "use_doc_unwarping": False,
+            "use_textline_orientation": False,
+        }
+        if device.lower() == "cpu":
+            options["enable_mkldnn"] = False
+        return PaddleOCR(**options)
     except TypeError:
-        return PaddleOCR(
-            lang="korean",
-            use_angle_cls=True,
-            enable_mkldnn=False,
-        )
+        legacy_options: dict[str, Any] = {
+            "lang": "korean",
+            "use_angle_cls": True,
+            "use_gpu": device.lower().startswith("gpu"),
+        }
+        if device.lower() == "cpu":
+            legacy_options["enable_mkldnn"] = False
+        return PaddleOCR(**legacy_options)
 
 
 def run_ocr(ocr: PaddleOCR, image_array: np.ndarray) -> list[OCRItem]:
@@ -196,7 +237,9 @@ def main() -> None:
     with Image.open(image_path) as opened_image:
         image = ImageOps.exif_transpose(opened_image).convert("RGB")
 
-    ocr = create_ocr()
+    validate_device(args.device)
+    print(f"PaddleOCR 추론 장치: {args.device}")
+    ocr = create_ocr(args.device)
     items = run_ocr(ocr, np.asarray(image))
     print_results(items)
 
