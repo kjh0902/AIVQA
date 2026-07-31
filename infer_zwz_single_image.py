@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import torch
 from PIL import Image, ImageOps
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
@@ -44,18 +45,26 @@ def main() -> None:
         raise SystemExit(f"입력 이미지를 찾을 수 없습니다: {image_path}")
     if args.max_new_tokens < 1:
         raise SystemExit("--max-new-tokens는 1 이상이어야 합니다.")
+    if not torch.cuda.is_available():
+        raise SystemExit("CUDA GPU가 필요합니다.")
 
     model = Qwen3VLForConditionalGeneration.from_pretrained(
         MODEL_ID,
-        dtype="auto",
+        dtype=torch.bfloat16,
         device_map="auto",
+        low_cpu_mem_usage=True,
+        attn_implementation="sdpa",
     )
+    model.eval()
     processor = AutoProcessor.from_pretrained(MODEL_ID)
     configure_image_pixel_limits(
         processor,
         DEFAULT_MIN_PIXELS,
         DEFAULT_MAX_PIXELS,
     )
+    if processor.tokenizer.pad_token_id is None:
+        processor.tokenizer.pad_token = processor.tokenizer.eos_token
+    processor.tokenizer.padding_side = "left"
 
     with Image.open(image_path) as image_file:
         image = ImageOps.exif_transpose(image_file).convert("RGB").copy()
@@ -83,10 +92,19 @@ def main() -> None:
         return_tensors="pt",
     ).to(model.device)
 
-    generated_ids = model.generate(
-        **inputs,
-        max_new_tokens=args.max_new_tokens,
-    )
+    with torch.inference_mode(), torch.autocast(
+        device_type="cuda",
+        dtype=torch.bfloat16,
+    ):
+        generated_ids = model.generate(
+            **inputs,
+            max_new_tokens=args.max_new_tokens,
+            do_sample=False,
+            num_beams=1,
+            use_cache=True,
+            pad_token_id=processor.tokenizer.pad_token_id,
+            eos_token_id=processor.tokenizer.eos_token_id,
+        )
     generated_ids_trimmed = [
         output_ids[len(input_ids) :]
         for input_ids, output_ids in zip(inputs.input_ids, generated_ids)
