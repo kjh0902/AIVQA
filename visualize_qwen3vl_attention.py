@@ -17,6 +17,7 @@ from typing import Any
 
 DEFAULT_MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
 DEFAULT_QUESTION = "이미지 오른쪽 위 안내판에 쓰인 내용을 읽어줘."
+DEFAULT_GENERAL_QUESTION = "Write a general description of the image."
 IMAGE_COMPRESSION_FACTOR = 32
 MIN_PIXELS = 64 * IMAGE_COMPRESSION_FACTOR**2
 MAX_PIXELS = 512 * IMAGE_COMPRESSION_FACTOR**2
@@ -25,8 +26,8 @@ MAX_PIXELS = 512 * IMAGE_COMPRESSION_FACTOR**2
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Save the last prompt token's image-attention heatmap for every "
-            "Qwen3-VL decoder layer."
+            "Save question, general, and relative image-attention heatmaps for "
+            "every Qwen3-VL decoder layer."
         )
     )
     parser.add_argument("--image", type=Path, required=True, help="Input image path")
@@ -34,6 +35,14 @@ def parse_args() -> argparse.Namespace:
         "--question",
         default=DEFAULT_QUESTION,
         help=f"Question paired with the image (default: {DEFAULT_QUESTION})",
+    )
+    parser.add_argument(
+        "--general-question",
+        default=DEFAULT_GENERAL_QUESTION,
+        help=(
+            "Baseline question used for relative attention "
+            f"(default: {DEFAULT_GENERAL_QUESTION})"
+        ),
     )
     parser.add_argument(
         "--model-id",
@@ -74,6 +83,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise FileNotFoundError(f"Image file does not exist: {args.image}")
     if not args.question.strip():
         raise ValueError("--question must not be empty")
+    if not args.general_question.strip():
+        raise ValueError("--general-question must not be empty")
     if args.gpu_memory_gib < 1:
         raise ValueError("--gpu-memory-gib must be at least 1")
     if args.preview_max_side < 1:
@@ -276,15 +287,20 @@ def resize_heatmap(heatmap: Any, size: tuple[int, int]) -> Any:
 
 
 def save_visualizations(
-    image: Any, attention_maps: Any, output_dir: Path, max_side: int, alpha: float
+    image: Any,
+    attention_maps: Any,
+    output_dir: Path,
+    map_name: str,
+    max_side: int,
+    alpha: float,
 ) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    output_dir.mkdir(parents=True, exist_ok=True)
     preview = make_preview(image, max_side)
-    preview.save(output_dir / "input_preview.png")
 
     for layer_index, heatmap in enumerate(attention_maps):
         resized = resize_heatmap(heatmap, preview.size)
@@ -297,7 +313,7 @@ def save_visualizations(
             resized, cmap="jet", alpha=alpha, vmin=0.0, vmax=1.0
         )
         axis.set_title(
-            f"Decoder layer {layer_index:02d} | "
+            f"{map_name.title()} | decoder layer {layer_index:02d} | "
             f"raw attention {float(heatmap.min()):.3e}–{float(heatmap.max()):.3e}"
         )
         axis.axis("off")
@@ -330,7 +346,10 @@ def save_visualizations(
         axis.imshow(resized, cmap="jet", alpha=alpha, vmin=0.0, vmax=1.0)
         axis.set_title(f"Layer {layer_index:02d}", fontsize=9)
         axis.axis("off")
-    figure.suptitle("Qwen3-VL: last prompt token → image-token attention", fontsize=14)
+    figure.suptitle(
+        f"Qwen3-VL {map_name}: last prompt token → image-token attention",
+        fontsize=14,
+    )
     figure.tight_layout()
     figure.savefig(output_dir / "all_layers_contact_sheet.png", dpi=150)
     plt.close(figure)
@@ -352,12 +371,12 @@ def run(args: argparse.Namespace) -> Path:
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[1/5] Loading processor: {args.model_id}", file=sys.stderr)
+    print(f"[1/6] Loading processor: {args.model_id}", file=sys.stderr)
     processor = AutoProcessor.from_pretrained(args.model_id)
     configure_image_pixel_limits(processor)
 
     print(
-        f"[2/5] Loading BF16 model with a {args.gpu_memory_gib} GiB GPU budget",
+        f"[2/6] Loading BF16 model with a {args.gpu_memory_gib} GiB GPU budget",
         file=sys.stderr,
     )
     model = Qwen3VLForConditionalGeneration.from_pretrained(
@@ -375,70 +394,137 @@ def run(args: argparse.Namespace) -> Path:
         image = ImageOps.exif_transpose(image_file).convert("RGB")
 
     print(
-        f"[3/5] Preparing image with min_pixels={MIN_PIXELS:,}, "
+        f"[3/6] Preparing image with min_pixels={MIN_PIXELS:,}, "
         f"max_pixels={MAX_PIXELS:,}",
         file=sys.stderr,
     )
-    inputs = prepare_inputs(processor, image, args.question)
     spatial_merge_size = int(model.config.vision_config.spatial_merge_size)
-    image_start, image_end, heatmap_shape, image_grid = locate_image_tokens(
-        inputs["input_ids"],
-        inputs["image_grid_thw"],
+    question_inputs = prepare_inputs(processor, image, args.question)
+    question_start, question_end, heatmap_shape, image_grid = locate_image_tokens(
+        question_inputs["input_ids"],
+        question_inputs["image_grid_thw"],
         processor.tokenizer,
         spatial_merge_size,
     )
-    attention_mask = inputs["attention_mask"][0]
-    query_index = int(attention_mask.nonzero(as_tuple=False)[-1].item())
-    query_token_id = int(inputs["input_ids"][0, query_index].item())
-    query_token = processor.tokenizer.convert_ids_to_tokens(query_token_id)
+    question_query_index = int(
+        question_inputs["attention_mask"][0].nonzero(as_tuple=False)[-1].item()
+    )
+    question_query_token_id = int(
+        question_inputs["input_ids"][0, question_query_index].item()
+    )
 
-    inputs = inputs.to(model.device)
+    question_inputs = question_inputs.to(model.device)
     print(
-        f"[4/5] Capturing {len(find_decoder_layers(model))} decoder layers "
-        f"(image tokens={image_end - image_start}, grid={heatmap_shape})",
+        f"[4/6] Capturing question attention from "
+        f"{len(find_decoder_layers(model))} decoder layers "
+        f"(image tokens={question_end - question_start}, grid={heatmap_shape})",
         file=sys.stderr,
     )
-    vectors = collect_layer_attention(
-        model, inputs, image_start, image_end, query_index
+    question_vectors = collect_layer_attention(
+        model,
+        question_inputs,
+        question_start,
+        question_end,
+        question_query_index,
     )
-    attention_maps = np.stack(
-        [vector.numpy().reshape(heatmap_shape) for vector in vectors]
+    question_maps = np.stack(
+        [vector.numpy().reshape(heatmap_shape) for vector in question_vectors]
     )
-    np.save(output_dir / "attention_maps.npy", attention_maps)
+    del question_inputs
+    torch.cuda.empty_cache()
 
-    print(f"[5/5] Saving heatmaps to {output_dir}", file=sys.stderr)
-    save_visualizations(
-        image,
-        attention_maps,
-        output_dir,
-        args.preview_max_side,
-        args.overlay_alpha,
+    general_inputs = prepare_inputs(processor, image, args.general_question)
+    general_start, general_end, general_shape, general_grid = locate_image_tokens(
+        general_inputs["input_ids"],
+        general_inputs["image_grid_thw"],
+        processor.tokenizer,
+        spatial_merge_size,
     )
+    if general_shape != heatmap_shape or general_grid != image_grid:
+        raise RuntimeError(
+            "Question and general prompts produced different image grids: "
+            f"question={image_grid}, general={general_grid}"
+        )
+    general_query_index = int(
+        general_inputs["attention_mask"][0].nonzero(as_tuple=False)[-1].item()
+    )
+    general_query_token_id = int(
+        general_inputs["input_ids"][0, general_query_index].item()
+    )
+    general_inputs = general_inputs.to(model.device)
+    print(
+        "[5/6] Capturing general-question attention",
+        file=sys.stderr,
+    )
+    general_vectors = collect_layer_attention(
+        model,
+        general_inputs,
+        general_start,
+        general_end,
+        general_query_index,
+    )
+    general_maps = np.stack(
+        [vector.numpy().reshape(heatmap_shape) for vector in general_vectors]
+    )
+    relative_maps = question_maps / (general_maps + 1e-8)
+    del general_inputs
+    torch.cuda.empty_cache()
+
+    np.savez(
+        output_dir / "attention_maps.npz",
+        question=question_maps,
+        general=general_maps,
+        relative=relative_maps,
+    )
+    make_preview(image, args.preview_max_side).save(output_dir / "input_preview.png")
+    print(f"[6/6] Saving three heatmap sets to {output_dir}", file=sys.stderr)
+    for map_name, maps in (
+        ("question", question_maps),
+        ("general", general_maps),
+        ("relative", relative_maps),
+    ):
+        save_visualizations(
+            image,
+            maps,
+            output_dir / map_name,
+            map_name,
+            args.preview_max_side,
+            args.overlay_alpha,
+        )
+
     metadata = {
         "model_id": args.model_id,
         "image": str(args.image.resolve()),
         "question": args.question,
+        "general_question": args.general_question,
         "min_pixels": MIN_PIXELS,
         "max_pixels": MAX_PIXELS,
         "image_grid_thw": image_grid,
         "spatial_merge_size": spatial_merge_size,
         "heatmap_shape": heatmap_shape,
-        "image_token_span": [image_start, image_end],
-        "query_token_index": query_index,
-        "query_token_id": query_token_id,
-        "query_token": query_token,
-        "decoder_layers": len(vectors),
+        "question_image_token_span": [question_start, question_end],
+        "general_image_token_span": [general_start, general_end],
+        "question_query_token_index": question_query_index,
+        "general_query_token_index": general_query_index,
+        "question_query_token_id": question_query_token_id,
+        "general_query_token_id": general_query_token_id,
+        "decoder_layers": len(question_vectors),
         "attention_definition": (
             "mean over heads of the last non-padding prompt token's causal "
-            "attention to image tokens; visualizations are min-max normalized "
-            "independently per layer"
+            "attention to image tokens"
+        ),
+        "relative_attention_definition": (
+            "question_attention / (general_attention + 1e-8)"
+        ),
+        "visualization_normalization": (
+            "min-max normalized independently for each layer and map type"
         ),
     }
     (output_dir / "metadata.json").write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
-    del inputs, model
+    del model
     torch.cuda.empty_cache()
     return output_dir
 
