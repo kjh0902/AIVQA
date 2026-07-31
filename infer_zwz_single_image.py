@@ -5,7 +5,14 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from PIL import Image, ImageOps
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+
+from train_lora import (
+    DEFAULT_MAX_PIXELS,
+    DEFAULT_MIN_PIXELS,
+    configure_image_pixel_limits,
+)
 
 
 MODEL_ID = "inclusionAI/ZwZ-8B"
@@ -44,12 +51,25 @@ def main() -> None:
         device_map="auto",
     )
     processor = AutoProcessor.from_pretrained(MODEL_ID)
+    configure_image_pixel_limits(
+        processor,
+        DEFAULT_MIN_PIXELS,
+        DEFAULT_MAX_PIXELS,
+    )
+
+    with Image.open(image_path) as image_file:
+        image = ImageOps.exif_transpose(image_file).convert("RGB").copy()
+
+    print(
+        f"Image pixel budget: min={DEFAULT_MIN_PIXELS:,}, "
+        f"max={DEFAULT_MAX_PIXELS:,}"
+    )
 
     messages = [
         {
             "role": "user",
             "content": [
-                {"type": "image", "image": str(image_path)},
+                {"type": "image", "image": image},
                 {"type": "text", "text": args.question},
             ],
         }
