@@ -180,12 +180,15 @@ def create_ocr(device: str) -> PaddleOCR:
         return PaddleOCR(**legacy_options)
 
 
-def run_ocr(ocr: PaddleOCR, image_array: np.ndarray) -> list[OCRItem]:
+def run_ocr(ocr: PaddleOCR, rgb_image_array: np.ndarray) -> list[OCRItem]:
+    # Pillow produces RGB arrays, while PaddleOCR/PaddleX expects OpenCV-style BGR.
+    bgr_image_array = np.ascontiguousarray(rgb_image_array[:, :, ::-1])
+
     if hasattr(ocr, "predict"):
-        return _parse_v3_results(ocr.predict(input=image_array))
+        return _parse_v3_results(ocr.predict(input=bgr_image_array))
 
     # PaddleOCR 2.x compatibility path
-    return _parse_legacy_results(ocr.ocr(image_array, cls=True))
+    return _parse_legacy_results(ocr.ocr(bgr_image_array, cls=True))
 
 
 def print_results(items: list[OCRItem]) -> None:
