@@ -12,6 +12,8 @@ from PIL import Image, ImageOps
 
 
 MAX_TEXT_CROPS = 3
+TARGET_READABLE_TEXT_HEIGHT = 24.0
+MAX_SMALL_TEXT_BOOST = 6.0
 MULTI_IMAGE_PROMPT_PREFIX = (
     "첫 번째 이미지는 전체 장면이고, 이후 이미지는 검출된 텍스트 영역을 확대한 "
     "이미지입니다. 모든 이미지를 함께 참고하여 답하시오."
@@ -132,21 +134,28 @@ def _should_merge(
     min_width = max(1, min(first.width, second.width))
     min_height = max(1, min(first.height, second.height))
     text_height = max(first.height, second.height)
+    height_similarity = min_height / text_height
     image_width, image_height = image_size
 
     same_line = (
-        vertical_overlap / min_height >= 0.35
-        and horizontal_gap <= min(3.0 * text_height, 0.12 * image_width)
+        height_similarity >= 0.50
+        and vertical_overlap / min_height >= 0.60
+        and horizontal_gap <= min(1.5 * text_height, 0.04 * image_width)
     )
+    first_center_x = (x1a + x2a) / 2
+    second_center_x = (x1b + x2b) / 2
+    horizontally_aligned = min(
+        abs(x1a - x1b),
+        abs(x2a - x2b),
+        abs(first_center_x - second_center_x),
+    ) <= 1.5 * text_height
     stacked_lines = (
-        horizontal_overlap / min_width >= 0.20
-        and vertical_gap <= min(2.0 * text_height, 0.10 * image_height)
+        height_similarity >= 0.50
+        and horizontal_overlap / min_width >= 0.50
+        and vertical_gap <= min(1.25 * text_height, 0.03 * image_height)
+        and horizontally_aligned
     )
-    locally_close = (
-        horizontal_gap <= min(1.2 * text_height, 0.05 * image_width)
-        and vertical_gap <= min(1.2 * text_height, 0.05 * image_height)
-    )
-    return same_line or stacked_lines or locally_close
+    return same_line or stacked_lines
 
 
 def _union_bbox(boxes: Sequence[DetectedTextBox]) -> BBox:
@@ -162,10 +171,13 @@ def select_text_group_bboxes(
     boxes: Sequence[DetectedTextBox],
     image_size: tuple[int, int],
     max_groups: int = MAX_TEXT_CROPS,
+    max_pixels: int | None = None,
 ) -> list[BBox]:
-    """Merge nearby detections and select up to three useful text groups."""
+    """Merge related detections and prioritize text made small by full-image scaling."""
     if not boxes or max_groups < 1:
         return []
+    if max_pixels is not None and max_pixels < 1:
+        raise ValueError("max_pixels must be positive")
 
     parents = list(range(len(boxes)))
 
@@ -191,6 +203,10 @@ def select_text_group_bboxes(
         components.setdefault(find(index), []).append(box)
 
     image_area = image_size[0] * image_size[1]
+    full_image_scale = min(
+        1.0,
+        math.sqrt((max_pixels or image_area) / max(1, image_area)),
+    )
     ranked_groups: list[tuple[float, BBox]] = []
     for members in components.values():
         bbox = _union_bbox(members)
@@ -207,7 +223,17 @@ def select_text_group_bboxes(
         )
         if nearly_full_image and density < 0.05:
             continue
-        priority = weighted_text_area * (1.0 + 0.2 * (len(members) - 1))
+        small_text_need = sum(
+            box.score
+            * min(
+                MAX_SMALL_TEXT_BOOST,
+                TARGET_READABLE_TEXT_HEIGHT
+                / max(1.0, box.height * full_image_scale),
+            )
+            for box in members
+        )
+        compactness = 0.5 + 0.5 * min(1.0, density)
+        priority = small_text_need * compactness
         ranked_groups.append((priority, bbox))
 
     ranked_groups.sort(key=lambda item: item[0], reverse=True)
@@ -244,7 +270,12 @@ def detect_text_crops(
     with Image.open(path) as image_file:
         image = ImageOps.exif_transpose(image_file).convert("RGB")
         boxes = detect_text_boxes(detector, path, image.size)
-        group_bboxes = select_text_group_bboxes(boxes, image.size, max_crops)
+        group_bboxes = select_text_group_bboxes(
+            boxes,
+            image.size,
+            max_crops,
+            max_pixels=max_pixels,
+        )
         crops = []
         for bbox in group_bboxes:
             crop_bbox = expand_bbox_if_within_limit(bbox, image.size, max_pixels)

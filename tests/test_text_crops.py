@@ -81,6 +81,43 @@ class TextCropTest(unittest.TestCase):
         self.assertEqual(len(groups), 3)
         self.assertIn((10, 10, 80, 20), groups)
 
+    def test_small_text_is_preferred_over_large_text_after_full_image_scaling(
+        self,
+    ) -> None:
+        boxes = [
+            DetectedTextBox((50, 50, 450, 150), 0.95),
+            DetectedTextBox((700, 700, 800, 710), 0.80),
+        ]
+
+        groups = select_text_group_bboxes(
+            boxes,
+            (1_000, 1_000),
+            max_groups=1,
+            max_pixels=250_000,
+        )
+
+        self.assertEqual(groups, [(700, 700, 800, 710)])
+
+    def test_diagonally_close_boxes_are_not_merged(self) -> None:
+        boxes = [
+            DetectedTextBox((10, 10, 30, 20), 0.9),
+            DetectedTextBox((34, 24, 54, 34), 0.9),
+        ]
+
+        groups = select_text_group_bboxes(boxes, (100, 100))
+
+        self.assertCountEqual(groups, [(10, 10, 30, 20), (34, 24, 54, 34)])
+
+    def test_separate_stacked_text_regions_are_not_overmerged(self) -> None:
+        boxes = [
+            DetectedTextBox((10, 10, 200, 20), 0.9),
+            DetectedTextBox((10, 35, 200, 45), 0.9),
+        ]
+
+        groups = select_text_group_bboxes(boxes, (300, 200))
+
+        self.assertCountEqual(groups, [(10, 10, 200, 20), (10, 35, 200, 45)])
+
     def test_bbox_expands_only_within_pixel_limit(self) -> None:
         bbox = (20, 20, 120, 70)
 
