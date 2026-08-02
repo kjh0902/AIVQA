@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any
 
 from aivqa.data import QwenVQADataset
-from aivqa.text_crops import TextCropDataset, build_text_detector
 from train_lora import (
     DATASET_DIR,
     DATASET_NAME,
@@ -141,14 +140,11 @@ def main() -> int:
     print(f"Run output directory: {run_output_dir}")
 
     base_dataset = QwenVQADataset(args.test_json, dataset_root=args.dataset_root)
-    print("Loading PP-OCRv5_server_det on CPU with MKLDNN disabled")
-    text_detector = build_text_detector()
-    dataset = TextCropDataset(base_dataset, text_detector, args.max_pixels)
     model, processor, dtype = build_pretrained_model_and_processor(args)
     predictions = generate_predictions(
         model,
         processor,
-        dataset,
+        base_dataset,
         args.eval_batch_size,
         args.max_new_tokens,
         dtype,

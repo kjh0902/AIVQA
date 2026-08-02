@@ -140,23 +140,19 @@ outputs/qwen3_vl_zero_shot/run_YYYYMMDD_HHMMSS/
 여부와 `--min-pixels`, `--max-pixels`, `--max-new-tokens` 값을 동일하게 지정해야
 합니다.
 
-## 질문별 OCR crop 확인
+## 단일 이미지 PaddleOCR 확인
 
-학습이나 추론을 실행하지 않고, 확인할 `question_id` 하나만 지정하여 해당 이미지의
-OCR crop 결과를 저장할 수 있습니다.
+학습이나 추론과 독립적으로 이미지 한 장에 PaddleOCR 검출·한국어 인식을 실행합니다.
 
 ```bash
 conda activate aivqa
-python debug_text_crops.py --question-id 0149
+python paddleocr_single_image_test.py --image datasets/test/0149.jpg
 ```
 
-동일한 ID가 여러 split에 있다면 `--split train`, `--split validation`, 또는
-`--split test`를 함께 지정합니다. 결과는 기본적으로
-`outputs/text_crop_debug/{split}_{question_id}_{실행시각}/`에 저장됩니다.
-
-- `original.png`: 원본 비교 이미지
-- `crop_1.png` ~ `crop_3.png`: 모델 입력과 동일한 OCR crop
-- `metadata.json`: 질문, 선택지, 원본 이미지 경로 및 crop 파일 목록
+`PP-OCRv5_server_det`와 `korean_PP-OCRv5_mobile_rec`을 사용합니다. EXIF 방향을
+보정한 원본 해상도 RGB 이미지, 각 검출의 좌표·문자열·confidence가 담긴 JSON,
+검출 다각형과 문자열을 표시한 PNG가
+`outputs/paddleocr_single_image/{이미지명}_{실행시각}/`에 저장됩니다.
 
 ## 전체 이미지 pixel 분석
 
