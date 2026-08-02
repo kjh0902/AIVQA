@@ -140,6 +140,24 @@ outputs/qwen3_vl_zero_shot/run_YYYYMMDD_HHMMSS/
 여부와 `--min-pixels`, `--max-pixels`, `--max-new-tokens` 값을 동일하게 지정해야
 합니다.
 
+## 질문별 OCR crop 확인
+
+학습이나 추론을 실행하지 않고, 확인할 `question_id` 하나만 지정하여 해당 이미지의
+OCR crop 결과를 저장할 수 있습니다.
+
+```bash
+conda activate aivqa
+python debug_text_crops.py --question-id 0149
+```
+
+동일한 ID가 여러 split에 있다면 `--split train`, `--split validation`, 또는
+`--split test`를 함께 지정합니다. 결과는 기본적으로
+`outputs/text_crop_debug/{split}_{question_id}_{실행시각}/`에 저장됩니다.
+
+- `original.png`: 원본 비교 이미지
+- `crop_1.png` ~ `crop_3.png`: 모델 입력과 동일한 OCR crop
+- `metadata.json`: 질문, 선택지, 원본 이미지 경로 및 crop 파일 목록
+
 ## 전체 이미지 pixel 분석
 
 모델을 로드하지 않고 train, validation, test JSON의 `model_input.image_name`을

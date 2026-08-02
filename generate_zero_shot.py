@@ -143,14 +143,7 @@ def main() -> int:
     base_dataset = QwenVQADataset(args.test_json, dataset_root=args.dataset_root)
     print("Loading PP-OCRv5_server_det on CPU with MKLDNN disabled")
     text_detector = build_text_detector()
-    debug_crop_dir = run_output_dir / "debug_text_crops"
-    print(f"Saving detected text crops for debugging: {debug_crop_dir}")
-    dataset = TextCropDataset(
-        base_dataset,
-        text_detector,
-        args.max_pixels,
-        debug_crop_dir=debug_crop_dir,
-    )
+    dataset = TextCropDataset(base_dataset, text_detector, args.max_pixels)
     model, processor, dtype = build_pretrained_model_and_processor(args)
     predictions = generate_predictions(
         model,
