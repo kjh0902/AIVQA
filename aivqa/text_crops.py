@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -298,12 +299,19 @@ def add_text_crops_to_feature(
 class TextCropDataset:
     """Inference-only dataset wrapper that adds detected text crops lazily."""
 
-    def __init__(self, dataset: Any, detector: Any, max_pixels: int) -> None:
+    def __init__(
+        self,
+        dataset: Any,
+        detector: Any,
+        max_pixels: int,
+        debug_crop_dir: str | Path | None = None,
+    ) -> None:
         if max_pixels < 1:
             raise ValueError("max_pixels must be positive")
         self.dataset = dataset
         self.detector = detector
         self.max_pixels = max_pixels
+        self.debug_crop_dir = Path(debug_crop_dir) if debug_crop_dir else None
 
     def __len__(self) -> int:
         return len(self.dataset)
@@ -315,4 +323,21 @@ class TextCropDataset:
             feature["image_path"],
             max_pixels=self.max_pixels,
         )
+        if self.debug_crop_dir is not None:
+            self._save_debug_crops(index, feature, crops)
         return add_text_crops_to_feature(feature, crops)
+
+    def _save_debug_crops(
+        self, index: int, feature: Mapping[str, Any], crops: Sequence[Image.Image]
+    ) -> None:
+        """Temporarily persist the exact crops passed to the model for inspection."""
+        self.debug_crop_dir.mkdir(parents=True, exist_ok=True)
+        question_id = re.sub(
+            r"[^0-9A-Za-z_.-]+", "_", str(feature.get("question_id", index))
+        ).strip("._")
+        sample_prefix = f"sample_{index:06d}_{question_id or index}"
+        for crop_index, crop in enumerate(crops, start=1):
+            crop.save(
+                self.debug_crop_dir / f"{sample_prefix}_crop_{crop_index}.png",
+                format="PNG",
+            )

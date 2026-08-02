@@ -164,6 +164,38 @@ class TextCropTest(unittest.TestCase):
 
         self.assertIs(result, feature)
 
+    def test_dataset_wrapper_saves_exact_debug_crops(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            image_path = temp_path / "sample.png"
+            debug_dir = temp_path / "debug"
+            Image.new("RGB", (200, 100), color=(255, 255, 255)).save(image_path)
+            feature = {
+                "image_path": str(image_path),
+                "question_id": "question/1",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": Image.new("RGB", (200, 100))},
+                            {"type": "text", "text": "question"},
+                        ],
+                    }
+                ],
+            }
+            detector = _FakeDetector([_polygon(10, 10, 40, 20)], [0.9])
+            wrapped = TextCropDataset(
+                [feature], detector, max_pixels=10_000, debug_crop_dir=debug_dir
+            )
+
+            result = wrapped[0]
+            saved_path = debug_dir / "sample_000000_question_1_crop_1.png"
+
+            self.assertTrue(saved_path.is_file())
+            with Image.open(saved_path) as saved_crop:
+                model_crop = result["messages"][0]["content"][1]["image"]
+                self.assertEqual(saved_crop.size, model_crop.size)
+
 
 if __name__ == "__main__":
     unittest.main()
