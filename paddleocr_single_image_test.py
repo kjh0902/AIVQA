@@ -6,7 +6,7 @@ import argparse
 import json
 import math
 import os
-from collections import defaultdict, deque
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -16,6 +16,8 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 DETECTION_MODEL = "PP-OCRv5_server_det"
 RECOGNITION_MODEL = "korean_PP-OCRv5_mobile_rec"
+TEXT_DET_LIMIT_TYPE = "max"
+TEXT_DET_LIMIT_SIDE_LEN = 1280
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,21 +40,24 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_ocr_pipeline(device: str) -> Any:
-    """Build only the requested detection and Korean recognition modules."""
+def build_ocr_models(device: str) -> tuple[Any, Any]:
+    """Build separate models so the detector's confidence scores are retained."""
     os.environ["FLAGS_use_mkldnn"] = "0"
-    from paddleocr import PaddleOCR
+    from paddleocr import TextDetection, TextRecognition
 
-    return PaddleOCR(
-        text_detection_model_name=DETECTION_MODEL,
-        text_recognition_model_name=RECOGNITION_MODEL,
-        use_doc_orientation_classify=False,
-        use_doc_unwarping=False,
-        use_textline_orientation=False,
-        text_rec_score_thresh=0.0,
+    detector = TextDetection(
+        model_name=DETECTION_MODEL,
+        limit_type=TEXT_DET_LIMIT_TYPE,
+        limit_side_len=TEXT_DET_LIMIT_SIDE_LEN,
         device=device,
         enable_mkldnn=False,
     )
+    recognizer = TextRecognition(
+        model_name=RECOGNITION_MODEL,
+        device=device,
+        enable_mkldnn=False,
+    )
+    return detector, recognizer
 
 
 def _result_payload(result: Any) -> Mapping[str, Any]:
@@ -80,12 +85,6 @@ def _polygon(polygon: Any) -> list[list[int | float]]:
     ]
 
 
-def _polygon_key(
-    polygon: Sequence[Sequence[int | float]],
-) -> tuple[tuple[float, float], ...]:
-    return tuple((float(point[0]), float(point[1])) for point in polygon)
-
-
 def _axis_aligned_bbox(
     polygon: Sequence[Sequence[int | float]], image_size: tuple[int, int]
 ) -> list[int]:
@@ -97,10 +96,10 @@ def _axis_aligned_bbox(
     return [x1, y1, x2, y2]
 
 
-def extract_text_results(
+def extract_detection_results(
     payload: Mapping[str, Any], image_size: tuple[int, int]
 ) -> list[dict[str, Any]]:
-    """Keep detector polygons separate and attach matching recognition output."""
+    """Keep every polygon and confidence returned by the detector independent."""
     detected_polygons = list(payload.get("dt_polys", []))
     detection_scores = list(payload.get("dt_scores", []))
     if len(detected_polygons) != len(detection_scores):
@@ -109,9 +108,6 @@ def extract_text_results(
         )
 
     entries: list[dict[str, Any]] = []
-    detection_indices: defaultdict[
-        tuple[tuple[float, float], ...], deque[int]
-    ] = defaultdict(deque)
     for index, (raw_polygon, detection_score) in enumerate(
         zip(detected_polygons, detection_scores), start=1
     ):
@@ -126,28 +122,96 @@ def extract_text_results(
                 "recognition_confidence": None,
             }
         )
-        detection_indices[_polygon_key(polygon)].append(index - 1)
-
-    recognized_polygons = list(payload.get("rec_polys", []))
-    recognized_texts = list(payload.get("rec_texts", []))
-    recognition_scores = list(payload.get("rec_scores", []))
-    if not (
-        len(recognized_polygons) == len(recognized_texts) == len(recognition_scores)
-    ):
-        raise RuntimeError("PaddleOCR returned mismatched recognition results")
-
-    for raw_polygon, text, recognition_score in zip(
-        recognized_polygons, recognized_texts, recognition_scores
-    ):
-        polygon = _polygon(raw_polygon)
-        matching_indices = detection_indices.get(_polygon_key(polygon))
-        if not matching_indices:
-            raise RuntimeError("Recognition polygon did not match a detection polygon")
-        entry = entries[matching_indices.popleft()]
-        entry["text"] = str(text)
-        entry["recognition_confidence"] = float(recognition_score)
-
     return entries
+
+
+def _distance(first: Sequence[float], second: Sequence[float]) -> float:
+    return math.hypot(first[0] - second[0], first[1] - second[1])
+
+
+def _extract_text_line(
+    image: Image.Image, polygon: Sequence[Sequence[int | float]]
+) -> Image.Image:
+    """Rectify one detector quadrilateral directly from the original RGB image."""
+    if len(polygon) != 4:
+        return image.crop(tuple(_axis_aligned_bbox(polygon, image.size)))
+
+    points = [[float(point[0]), float(point[1])] for point in polygon]
+    top_left = min(points, key=lambda point: point[0] + point[1])
+    bottom_right = max(points, key=lambda point: point[0] + point[1])
+    top_right = min(points, key=lambda point: point[1] - point[0])
+    bottom_left = max(points, key=lambda point: point[1] - point[0])
+    width = max(
+        1,
+        round(
+            max(
+                _distance(top_left, top_right),
+                _distance(bottom_left, bottom_right),
+            )
+        ),
+    )
+    height = max(
+        1,
+        round(
+            max(
+                _distance(top_left, bottom_left),
+                _distance(top_right, bottom_right),
+            )
+        ),
+    )
+    quad = (
+        *top_left,
+        *bottom_left,
+        *bottom_right,
+        *top_right,
+    )
+    text_line = image.transform(
+        (width, height),
+        Image.Transform.QUAD,
+        quad,
+        resample=Image.Resampling.BICUBIC,
+    )
+    if text_line.height / max(1, text_line.width) >= 1.5:
+        text_line = text_line.rotate(90, expand=True)
+    return text_line
+
+
+def recognize_text_results(
+    recognizer: Any,
+    image: Image.Image,
+    entries: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Recognize each independent polygon using temporary lossless line images."""
+    recognized_entries = [dict(entry) for entry in entries]
+    if not recognized_entries:
+        return recognized_entries
+
+    with tempfile.TemporaryDirectory(prefix="paddleocr_text_lines_") as temp_dir:
+        temp_path = Path(temp_dir)
+        text_line_paths = []
+        for index, entry in enumerate(recognized_entries, start=1):
+            text_line = _extract_text_line(image, entry["polygon"])
+            text_line_path = temp_path / f"text_line_{index:05d}.png"
+            text_line.save(text_line_path, format="PNG")
+            text_line_paths.append(str(text_line_path))
+
+        recognition_results = list(
+            recognizer.predict(text_line_paths, batch_size=1)
+        )
+
+    if len(recognition_results) != len(recognized_entries):
+        raise RuntimeError(
+            "PaddleOCR returned a different number of recognition results"
+        )
+    for entry, result in zip(recognized_entries, recognition_results):
+        payload = _result_payload(result)
+        if "rec_text" not in payload or "rec_score" not in payload:
+            raise RuntimeError(
+                "PaddleOCR recognition result is missing required fields"
+            )
+        entry["text"] = str(payload["rec_text"])
+        entry["recognition_confidence"] = float(payload["rec_score"])
+    return recognized_entries
 
 
 def create_output_dir(root: Path, image_stem: str) -> Path:
@@ -227,12 +291,21 @@ def main() -> int:
     print(f"Image size: {image.width}x{image.height}")
     print(f"Detection model: {DETECTION_MODEL}")
     print(f"Recognition model: {RECOGNITION_MODEL}")
-    pipeline = build_ocr_pipeline(args.device)
-    result = next(iter(pipeline.predict(str(normalized_image_path))), None)
-    if result is None:
-        raise RuntimeError("PaddleOCR returned no result")
+    print(
+        f"Detection input limit: {TEXT_DET_LIMIT_TYPE} "
+        f"{TEXT_DET_LIMIT_SIDE_LEN}px"
+    )
+    detector, recognizer = build_ocr_models(args.device)
+    detection_result = next(
+        iter(detector.predict(str(normalized_image_path), batch_size=1)), None
+    )
+    if detection_result is None:
+        raise RuntimeError("PaddleOCR text detector returned no result")
 
-    entries = extract_text_results(_result_payload(result), image.size)
+    entries = extract_detection_results(
+        _result_payload(detection_result), image.size
+    )
+    entries = recognize_text_results(recognizer, image, entries)
     json_path = output_dir / "ocr_results.json"
     visualization_path = output_dir / "ocr_visualization.png"
     output = {

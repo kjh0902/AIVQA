@@ -153,6 +153,7 @@ python paddleocr_single_image_test.py --image datasets/test/0149.jpg
 보정한 원본 해상도 RGB 이미지, 각 검출의 좌표·문자열·confidence가 담긴 JSON,
 검출 다각형과 문자열을 표시한 PNG가
 `outputs/paddleocr_single_image/{이미지명}_{실행시각}/`에 저장됩니다.
+CPU 부하를 제한하기 위해 검출 입력의 긴 변은 최대 1280px로 제한합니다.
 
 ## 전체 이미지 pixel 분석
 

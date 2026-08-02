@@ -13,57 +13,103 @@ from PIL import Image
 from paddleocr_single_image_test import (
     DETECTION_MODEL,
     RECOGNITION_MODEL,
-    build_ocr_pipeline,
-    extract_text_results,
+    TEXT_DET_LIMIT_SIDE_LEN,
+    TEXT_DET_LIMIT_TYPE,
+    build_ocr_models,
+    extract_detection_results,
     load_original_rgb,
+    recognize_text_results,
     save_visualization,
 )
 
 
 class SingleImageOcrTest(unittest.TestCase):
-    def test_builds_requested_detection_and_korean_recognition_pipeline(self) -> None:
-        calls = []
+    def test_builds_requested_detection_and_korean_recognition_models(self) -> None:
+        detection_calls = []
+        recognition_calls = []
 
-        class FakePaddleOCR:
+        class FakeTextDetection:
             def __init__(self, **kwargs) -> None:
-                calls.append(kwargs)
+                detection_calls.append(kwargs)
 
-        fake_module = types.SimpleNamespace(PaddleOCR=FakePaddleOCR)
+        class FakeTextRecognition:
+            def __init__(self, **kwargs) -> None:
+                recognition_calls.append(kwargs)
+
+        fake_module = types.SimpleNamespace(
+            TextDetection=FakeTextDetection,
+            TextRecognition=FakeTextRecognition,
+        )
         with patch.dict(sys.modules, {"paddleocr": fake_module}):
-            pipeline = build_ocr_pipeline("cpu")
+            detector, recognizer = build_ocr_models("cpu")
 
-        self.assertIsInstance(pipeline, FakePaddleOCR)
-        self.assertEqual(calls[0]["text_detection_model_name"], DETECTION_MODEL)
-        self.assertEqual(calls[0]["text_recognition_model_name"], RECOGNITION_MODEL)
-        self.assertFalse(calls[0]["use_doc_orientation_classify"])
-        self.assertFalse(calls[0]["use_doc_unwarping"])
-        self.assertFalse(calls[0]["use_textline_orientation"])
-        self.assertEqual(calls[0]["text_rec_score_thresh"], 0.0)
+        self.assertIsInstance(detector, FakeTextDetection)
+        self.assertIsInstance(recognizer, FakeTextRecognition)
+        self.assertEqual(detection_calls[0]["model_name"], DETECTION_MODEL)
+        self.assertEqual(detection_calls[0]["limit_type"], TEXT_DET_LIMIT_TYPE)
+        self.assertEqual(
+            detection_calls[0]["limit_side_len"], TEXT_DET_LIMIT_SIDE_LEN
+        )
+        self.assertEqual(recognition_calls[0]["model_name"], RECOGNITION_MODEL)
         self.assertEqual(os.environ["FLAGS_use_mkldnn"], "0")
 
-    def test_keeps_each_detection_independent_and_attaches_recognition(self) -> None:
+    def test_keeps_each_detection_and_confidence_independent(self) -> None:
         payload = {
             "dt_polys": [
                 [[10, 10], [40, 8], [42, 20], [12, 22]],
                 [[60, 30], [90, 30], [90, 40], [60, 40]],
             ],
             "dt_scores": [0.91, 0.82],
-            "rec_polys": [
-                [[60, 30], [90, 30], [90, 40], [60, 40]],
-                [[10, 10], [40, 8], [42, 20], [12, 22]],
-            ],
-            "rec_texts": ["두 번째", "첫 번째"],
-            "rec_scores": [0.88, 0.97],
         }
 
-        entries = extract_text_results(payload, (100, 80))
+        entries = extract_detection_results(payload, (100, 80))
 
         self.assertEqual(len(entries), 2)
         self.assertEqual(entries[0]["bbox"], [10, 8, 42, 22])
-        self.assertEqual(entries[0]["text"], "첫 번째")
         self.assertEqual(entries[0]["detection_confidence"], 0.91)
-        self.assertEqual(entries[0]["recognition_confidence"], 0.97)
-        self.assertEqual(entries[1]["text"], "두 번째")
+        self.assertEqual(entries[1]["detection_confidence"], 0.82)
+
+    def test_recognizes_each_detection_from_lossless_temporary_image(self) -> None:
+        class FakeRecognizer:
+            def predict(self, image_paths, batch_size=1):
+                self.image_paths = image_paths
+                self.batch_size = batch_size
+                self.paths_existed_during_prediction = all(
+                    Path(path).is_file() for path in image_paths
+                )
+                return [
+                    {"res": {"rec_text": "첫 번째", "rec_score": 0.97}},
+                    {"res": {"rec_text": "두 번째", "rec_score": 0.88}},
+                ]
+
+        entries = [
+            {
+                "index": 1,
+                "polygon": [[10, 10], [50, 10], [50, 25], [10, 25]],
+                "text": "",
+                "detection_confidence": 0.91,
+                "recognition_confidence": None,
+            },
+            {
+                "index": 2,
+                "polygon": [[60, 30], [100, 30], [100, 45], [60, 45]],
+                "text": "",
+                "detection_confidence": 0.82,
+                "recognition_confidence": None,
+            },
+        ]
+        recognizer = FakeRecognizer()
+
+        results = recognize_text_results(
+            recognizer, Image.new("RGB", (120, 80), color="white"), entries
+        )
+
+        self.assertTrue(recognizer.paths_existed_during_prediction)
+        self.assertEqual(recognizer.batch_size, 1)
+        self.assertEqual(results[0]["text"], "첫 번째")
+        self.assertEqual(results[0]["recognition_confidence"], 0.97)
+        self.assertEqual(results[1]["text"], "두 번째")
+        self.assertEqual(results[1]["recognition_confidence"], 0.88)
 
     def test_applies_exif_rotation_and_converts_to_original_rgb(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
