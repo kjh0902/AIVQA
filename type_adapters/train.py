@@ -48,6 +48,12 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--shared-adapter-dir", type=Path, required=True)
+    parser.add_argument(
+        "--question-form",
+        choices=("ALL", *QUESTION_FORMS),
+        default="ALL",
+        help="Train all adapters sequentially (default) or only one of MC/SA/LA",
+    )
     parser.add_argument("--model-id", default=MODEL_ID)
     parser.add_argument(
         "--train-json", type=Path, default=DATASET_DIR / f"{DATASET_NAME}_train.json"
@@ -130,6 +136,10 @@ def validate_args(args: argparse.Namespace) -> None:
 def selection_score(question_form: str, metrics: dict[str, float]) -> tuple[str, float]:
     metric_name = SELECTION_METRICS[question_form]
     return metric_name, float(metrics[metric_name])
+
+
+def selected_question_forms(question_form: str) -> tuple[str, ...]:
+    return QUESTION_FORMS if question_form == "ALL" else (question_form,)
 
 
 def _serialized_args(args: argparse.Namespace) -> dict[str, Any]:
@@ -321,7 +331,7 @@ def _write_run_summary(
     payload = {
         "shared_adapter_dir": str(args.shared_adapter_dir.resolve()),
         "independent_shared_initialization": True,
-        "question_form_order": list(QUESTION_FORMS),
+        "question_form_order": list(selected_question_forms(args.question_form)),
         "args": _serialized_args(args),
         "results": results,
     }
@@ -348,7 +358,7 @@ def main() -> int:
     validation_subsets = build_type_subsets(validation_base)
 
     results: list[dict[str, Any]] = []
-    for question_form in QUESTION_FORMS:
+    for question_form in selected_question_forms(args.question_form):
         print(
             f"\nStarting independent {question_form} continuation from Shared Adapter: "
             f"{args.shared_adapter_dir}"

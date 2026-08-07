@@ -14,7 +14,7 @@ from type_adapters.modeling import (
     load_trainable_shared_adapter,
     validate_type_adapter_set,
 )
-from type_adapters.train import selection_score
+from type_adapters.train import parse_args, selected_question_forms, selection_score
 
 
 class _FakeDataset:
@@ -90,6 +90,19 @@ class TypeAdapterDataTest(unittest.TestCase):
         self.assertEqual(selection_score("MC", metrics), ("mc_accuracy", 0.7))
         self.assertEqual(selection_score("SA", metrics), ("sa_exact_match", 0.4))
         self.assertEqual(selection_score("LA", metrics), ("descriptive_avg", 0.2))
+
+    def test_training_can_select_all_or_one_question_form(self) -> None:
+        self.assertEqual(selected_question_forms("ALL"), ("MC", "SA", "LA"))
+        self.assertEqual(selected_question_forms("MC"), ("MC",))
+        self.assertEqual(selected_question_forms("SA"), ("SA",))
+        self.assertEqual(selected_question_forms("LA"), ("LA",))
+
+        with patch(
+            "sys.argv",
+            ["train.py", "--shared-adapter-dir", "shared", "--question-form", "MC"],
+        ):
+            args = parse_args()
+        self.assertEqual(args.question_form, "MC")
 
 
 class TypeAdapterPeftTest(unittest.TestCase):
