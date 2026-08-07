@@ -26,8 +26,8 @@ TEST_PREDICTIONS_NAME = f"{DATASET_NAME}_test_predictions.json"
 EXPECTED_DECODER_LAYERS = 32
 PROJECTION_NAMES = ("q_proj", "k_proj", "v_proj", "o_proj")
 IMAGE_COMPRESSION_FACTOR = 28
-DEFAULT_MIN_PIXELS = 100 * IMAGE_COMPRESSION_FACTOR**2
-DEFAULT_MAX_PIXELS = 400 * IMAGE_COMPRESSION_FACTOR**2
+DEFAULT_MIN_PIXELS = 200 * IMAGE_COMPRESSION_FACTOR**2
+DEFAULT_MAX_PIXELS = 1600 * IMAGE_COMPRESSION_FACTOR**2
 MODEL_MAX_PIXELS = 1600 * IMAGE_COMPRESSION_FACTOR**2
 TARGET_PATTERN = re.compile(
     r"^model\.layers\.(\d+)\.self_attn\."
@@ -74,7 +74,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--early-stopping-patience", type=int, default=2)
     parser.add_argument("--max-length", type=int, default=2048)
-    parser.add_argument("--max-new-tokens", type=int, default=128)
+    parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
