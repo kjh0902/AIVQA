@@ -1,4 +1,4 @@
-"""Runtime dataset conversion and collators for Qwen3-VL."""
+"""Dataset conversion and collators for Kanana-V."""
 
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ QUESTION_FORM_INSTRUCTIONS = {
     ),
     "SA": (
         "질문에서 요구한 음절 수, 어절 수, 답의 개수를 정확히 지키고 정답만 "
-        "출력하세요. 설명이나 부가 문장은 출력하지 마세요."
+        "간결하게 출력하세요. 설명이나 부가 문장은 출력하지 마세요."
     ),
     "LA": (
         "250자 이내의 한 문단으로 답하세요. 같은 내용을 반복하지 말고, 이미지와 "
@@ -57,12 +57,11 @@ def format_question(question_form: str, question: str, options: Sequence[str]) -
     normalized_options = [str(option).strip() for option in options if str(option).strip()]
     if normalized_options:
         parts.append("선택지:\n" + "\n".join(normalized_options))
-
     return "\n\n".join(parts)
 
 
-class QwenVQADataset:
-    """Map-style dataset that converts the source JSON only when indexed.
+class KananaVQADataset:
+    """Load source JSON and build one-image Kanana conversation samples lazily.
 
     The source file and images are never rewritten. ``dataset_root`` should be
     the directory containing the ``train``, ``validation``, and ``test`` image
@@ -101,6 +100,12 @@ class QwenVQADataset:
         model_input = self._require_mapping(record, "model_input", index)
 
         question_form = self._require_text(metadata, "question_form", index).upper()
+        if question_form not in QUESTION_FORM_INSTRUCTIONS:
+            allowed = ", ".join(QUESTION_FORM_INSTRUCTIONS)
+            raise ValueError(
+                f"Sample {index}: unsupported question_form {question_form!r}; "
+                f"expected one of: {allowed}"
+            )
         question = self._require_text(model_input, "question", index)
         options = model_input.get("options", [])
         if not isinstance(options, list):
@@ -117,15 +122,12 @@ class QwenVQADataset:
         instruction_prompt = (
             f"{self.system_prompt}\n\n{QUESTION_FORM_INSTRUCTIONS[question_form]}"
         )
-        prompt_messages = [
+        # This follows the model card's native input format: images are passed
+        # separately and each image is represented by one <image> marker in conv.
+        conversation = [
             {"role": "system", "content": instruction_prompt},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": image},
-                    {"type": "text", "text": formatted_question},
-                ],
-            },
+            {"role": "user", "content": "<image>"},
+            {"role": "user", "content": formatted_question},
         ]
 
         model_output = record.get("model_output")
@@ -134,7 +136,8 @@ class QwenVQADataset:
             answer = str(answer).strip()
 
         return {
-            "messages": prompt_messages,
+            "conversation": conversation,
+            "image": image,
             "answer": answer,
             "question_id": str(metadata.get("question_id", index)),
             "question_form": question_form,
@@ -183,7 +186,6 @@ class QwenVQADataset:
     def _load_rgb_image(image_path: Path, index: int) -> Image.Image:
         try:
             with Image.open(image_path) as image_file:
-                # Copy detaches the in-memory RGB image from the closed source file.
                 return ImageOps.exif_transpose(image_file).convert("RGB").copy()
         except (OSError, ValueError) as error:
             raise ValueError(
@@ -191,103 +193,95 @@ class QwenVQADataset:
             ) from error
 
 
-def _prompt_messages(feature: dict[str, Any]) -> list[dict[str, Any]]:
-    messages = feature.get("messages")
-    if not isinstance(messages, list) or not messages:
-        raise ValueError("Each feature must contain a non-empty messages list")
-    if any(message.get("role") == "assistant" for message in messages):
-        raise ValueError("Dataset messages must contain only the system/user prompt")
+def _conversation(feature: dict[str, Any]) -> list[dict[str, str]]:
+    conversation = feature.get("conversation")
+    if not isinstance(conversation, list) or not conversation:
+        raise ValueError("Each feature must contain a non-empty conversation list")
+    if any(message.get("role") == "assistant" for message in conversation):
+        raise ValueError("Dataset conversations must contain only the prompt")
 
-    # Multimodal processors expect every content value to be a list of typed
-    # items. Normalize string content only at collation time so the Dataset can
-    # retain the requested Qwen messages representation.
-    copied_messages = []
-    for message in messages:
-        copied_message = dict(message)
+    copied: list[dict[str, str]] = []
+    for message in conversation:
+        role = message.get("role")
         content = message.get("content")
-        if isinstance(content, str):
-            copied_message["content"] = [{"type": "text", "text": content}]
-        elif isinstance(content, list):
-            copied_message["content"] = [dict(item) for item in content]
-        else:
-            raise ValueError("Each message content must be a string or a list")
-        copied_messages.append(copied_message)
-    return copied_messages
+        if role not in {"system", "user"} or not isinstance(content, str):
+            raise ValueError("Conversation messages must have a valid role and text content")
+        copied.append({"role": role, "content": content})
+    return copied
+
+
+def _processor_sample(
+    feature: dict[str, Any], conversation: list[dict[str, str]]
+) -> dict[str, Any]:
+    image = feature.get("image")
+    if not isinstance(image, Image.Image):
+        raise ValueError("Each feature must contain one in-memory PIL image")
+    return {"image": [image], "conv": conversation}
 
 
 @dataclass
 class TrainCollator:
-    """Create a padded Qwen batch with assistant-only language-model labels."""
+    """Build a Kanana batch with assistant-only language-model labels."""
 
     processor: Any
+    max_length: int = 2048
     ignore_index: int = -100
 
-    def __call__(self, features: Sequence[dict[str, Any]]) -> Any:
+    def __call__(self, features: Sequence[dict[str, Any]]) -> dict[str, Any]:
         if not features:
             raise ValueError("TrainCollator received an empty batch")
 
-        full_conversations: list[list[dict[str, Any]]] = []
-        prompt_conversations: list[list[dict[str, Any]]] = []
+        full_samples: list[dict[str, Any]] = []
+        prompt_samples: list[dict[str, Any]] = []
         for feature in features:
-            prompt = _prompt_messages(feature)
+            prompt = _conversation(feature)
             answer = feature.get("answer")
             if answer is None or not str(answer).strip():
                 question_id = feature.get("question_id", "<unknown>")
                 raise ValueError(
                     f"Training sample {question_id} does not contain a non-empty answer"
                 )
-            prompt_conversations.append(prompt)
-            full_conversations.append(
-                prompt
-                + [
-                    {
-                        "role": "assistant",
-                        "content": [
-                            {"type": "text", "text": str(answer).strip()}
-                        ],
-                    }
-                ]
+            prompt_samples.append(_processor_sample(feature, prompt))
+            full_samples.append(
+                _processor_sample(
+                    feature,
+                    prompt
+                    + [{"role": "assistant", "content": str(answer).strip()}],
+                )
             )
 
-        batch = self.processor.apply_chat_template(
-            full_conversations,
-            tokenize=True,
+        batch = self.processor.batch_encode_collate(
+            full_samples,
+            padding="longest",
+            padding_side="right",
+            max_length=self.max_length,
             add_generation_prompt=False,
-            padding=True,
-            return_dict=True,
-            return_tensors="pt",
         )
-
-        prompt_lengths = []
-        for prompt in prompt_conversations:
-            prompt_inputs = self.processor.apply_chat_template(
-                prompt,
-                tokenize=True,
-                add_generation_prompt=True,
-                padding=False,
-                return_dict=True,
-                return_tensors="pt",
-            )
-            prompt_lengths.append(int(prompt_inputs["attention_mask"].sum().item()))
+        prompt_batch = self.processor.batch_encode_collate(
+            prompt_samples,
+            padding="longest",
+            padding_side="right",
+            max_length=self.max_length,
+            add_generation_prompt=True,
+        )
 
         input_ids = batch["input_ids"]
         attention_mask = batch["attention_mask"]
+        prompt_attention_mask = prompt_batch["attention_mask"]
         labels = input_ids.clone() if hasattr(input_ids, "clone") else input_ids.copy()
         labels[attention_mask == 0] = self.ignore_index
+        labels[input_ids < 0] = self.ignore_index
 
-        padding_side = getattr(self.processor.tokenizer, "padding_side", "right")
-        sequence_length = labels.shape[1]
-        for row, prompt_length in enumerate(prompt_lengths):
+        for row in range(len(features)):
+            prompt_length = int(prompt_attention_mask[row].sum().item())
             full_length = int(attention_mask[row].sum().item())
             if prompt_length >= full_length:
+                question_id = features[row].get("question_id", "<unknown>")
                 raise ValueError(
-                    "The processed assistant answer contains no trainable tokens"
+                    f"Training sample {question_id} has no answer tokens after processing; "
+                    "increase --max-length"
                 )
-            if padding_side == "left":
-                start = sequence_length - full_length
-                labels[row, start : start + prompt_length] = self.ignore_index
-            else:
-                labels[row, :prompt_length] = self.ignore_index
+            labels[row, :prompt_length] = self.ignore_index
 
         batch["labels"] = labels
         return batch
@@ -295,19 +289,21 @@ class TrainCollator:
 
 @dataclass
 class GenerationCollator:
-    """Create a padded Qwen generation batch without assistant answers."""
+    """Build a left-padded Kanana generation batch without reference answers."""
 
     processor: Any
+    max_length: int = 2048
 
-    def __call__(self, features: Sequence[dict[str, Any]]) -> Any:
+    def __call__(self, features: Sequence[dict[str, Any]]) -> dict[str, Any]:
         if not features:
             raise ValueError("GenerationCollator received an empty batch")
-        conversations = [_prompt_messages(feature) for feature in features]
-        return self.processor.apply_chat_template(
-            conversations,
-            tokenize=True,
+        samples = [
+            _processor_sample(feature, _conversation(feature)) for feature in features
+        ]
+        return self.processor.batch_encode_collate(
+            samples,
+            padding="longest",
+            padding_side="left",
+            max_length=self.max_length,
             add_generation_prompt=True,
-            padding=True,
-            return_dict=True,
-            return_tensors="pt",
         )

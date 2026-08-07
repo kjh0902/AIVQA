@@ -8,39 +8,44 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from aivqa.data import GenerationCollator, QwenVQADataset, TrainCollator
-
-
-class _FakeTokenizer:
-    padding_side = "right"
+from aivqa.data import GenerationCollator, KananaVQADataset, TrainCollator
 
 
 class _FakeProcessor:
     def __init__(self) -> None:
-        self.tokenizer = _FakeTokenizer()
         self.calls = []
 
-    def apply_chat_template(self, conversations, **kwargs):
-        self.calls.append((conversations, kwargs))
-        is_batch = bool(conversations and isinstance(conversations[0], list))
-        batch = conversations if is_batch else [conversations]
-        for chat in batch:
-            for message in chat:
-                if not isinstance(message["content"], list):
-                    raise TypeError("processor message content must be a list")
-                if not all(
-                    isinstance(item, dict) and "type" in item
-                    for item in message["content"]
-                ):
-                    raise TypeError("processor content items must be typed dictionaries")
-        lengths = [5 if chat[-1]["role"] == "assistant" else 4 for chat in batch]
+    def batch_encode_collate(self, samples, **kwargs):
+        self.calls.append((samples, kwargs))
+        lengths = []
+        for sample in samples:
+            self.assert_sample(sample)
+            has_answer = sample["conv"][-1]["role"] == "assistant"
+            lengths.append(6 if has_answer else 5)
+
         width = max(lengths)
-        input_ids = np.zeros((len(batch), width), dtype=np.int64)
+        input_ids = np.zeros((len(samples), width), dtype=np.int64)
         attention_mask = np.zeros_like(input_ids)
         for row, length in enumerate(lengths):
             input_ids[row, :length] = np.arange(1, length + 1)
+            input_ids[row, 2] = -1
             attention_mask[row, :length] = 1
-        return {"input_ids": input_ids, "attention_mask": attention_mask}
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "pixel_values": np.ones((len(samples), 2), dtype=np.float32),
+            "image_metas": {"vision_grid_thw": np.ones((len(samples), 3))},
+        }
+
+    @staticmethod
+    def assert_sample(sample) -> None:
+        if set(sample) != {"image", "conv"}:
+            raise TypeError("processor sample must contain image and conv")
+        if len(sample["image"]) != 1 or not isinstance(sample["image"][0], Image.Image):
+            raise TypeError("processor sample must contain one PIL image")
+        for message in sample["conv"]:
+            if not isinstance(message["content"], str):
+                raise TypeError("conversation content must be text")
 
 
 class DatasetTest(unittest.TestCase):
@@ -51,7 +56,6 @@ class DatasetTest(unittest.TestCase):
         Image.new("RGB", (8, 8), color=(255, 0, 0)).save(
             self.root / "train" / "mc.jpg", format="JPEG"
         )
-        # Deliberately store TIFF bytes under a .jpg name to reproduce the source data.
         Image.new("RGBA", (8, 8), color=(0, 255, 0, 128)).save(
             self.root / "train" / "sa.jpg", format="TIFF"
         )
@@ -104,7 +108,7 @@ class DatasetTest(unittest.TestCase):
         self.json_path.write_text(
             json.dumps(records, ensure_ascii=False), encoding="utf-8"
         )
-        self.dataset = QwenVQADataset(self.json_path, dataset_root=self.root)
+        self.dataset = KananaVQADataset(self.json_path, dataset_root=self.root)
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
@@ -114,16 +118,19 @@ class DatasetTest(unittest.TestCase):
         self.assertIn("객관식 (MC)", sample["formatted_question"])
         self.assertIn("선택지:\n1) 첫째\n2) 둘째", sample["formatted_question"])
         self.assertEqual(sample["answer"], "2")
-        self.assertEqual([message["role"] for message in sample["messages"]], ["system", "user"])
-        self.assertIsInstance(sample["messages"][0]["content"], str)
+        self.assertEqual(
+            [message["role"] for message in sample["conversation"]],
+            ["system", "user", "user"],
+        )
+        self.assertEqual(sample["conversation"][1]["content"], "<image>")
 
-    def test_empty_options_are_not_rendered(self) -> None:
+    def test_empty_options_are_not_rendered_and_source_image_is_unchanged(self) -> None:
         sample = self.dataset[1]
         formatted_question = sample["formatted_question"]
         self.assertNotIn("선택지:", formatted_question)
         self.assertNotIn("[]", formatted_question)
 
-        image = sample["messages"][1]["content"][0]["image"]
+        image = sample["image"]
         self.assertIsInstance(image, Image.Image)
         self.assertEqual(image.mode, "RGB")
         self.assertEqual(image.getpixel((0, 0)), (0, 255, 0))
@@ -131,9 +138,9 @@ class DatasetTest(unittest.TestCase):
             (self.root / "train" / "sa.jpg").read_bytes(), self.original_tiff_bytes
         )
 
-    def test_question_form_specific_instructions_are_used_by_both_collators(self) -> None:
+    def test_question_form_specific_instructions_reach_both_collators(self) -> None:
         samples = [self.dataset[index] for index in range(3)]
-        prompts = [sample["messages"][0]["content"] for sample in samples]
+        prompts = [sample["conversation"][0]["content"] for sample in samples]
 
         self.assertIn("오름차순", prompts[0])
         self.assertIn("음절 수, 어절 수, 답의 개수", prompts[1])
@@ -143,46 +150,43 @@ class DatasetTest(unittest.TestCase):
         for collator_type in (TrainCollator, GenerationCollator):
             processor = _FakeProcessor()
             collator_type(processor)(samples)
-            conversations = processor.calls[0][0]
             collated_prompts = [
-                conversation[0]["content"][0]["text"]
-                for conversation in conversations
+                sample["conv"][0]["content"] for sample in processor.calls[0][0]
             ]
             self.assertEqual(collated_prompts, prompts)
 
-    def test_message_copy_reuses_in_memory_image(self) -> None:
+    def test_collator_uses_native_sample_shape_and_reuses_image(self) -> None:
         sample = self.dataset[0]
-        original_image = sample["messages"][1]["content"][0]["image"]
         processor = _FakeProcessor()
         TrainCollator(processor)([sample])
-        collated_image = processor.calls[0][0][0][1]["content"][0]["image"]
-        self.assertIs(collated_image, original_image)
+        processor_sample = processor.calls[0][0][0]
+        self.assertIs(processor_sample["image"][0], sample["image"])
+        self.assertEqual(set(processor_sample), {"image", "conv"})
 
-    def test_train_collator_adds_answer_and_masks_prompt(self) -> None:
+    def test_train_collator_adds_answer_and_masks_prompt_and_image_tokens(self) -> None:
         processor = _FakeProcessor()
         batch = TrainCollator(processor)([self.dataset[0]])
-        full_conversation = processor.calls[0][0][0]
+        full_conversation = processor.calls[0][0][0]["conv"]
         self.assertEqual(
-            full_conversation[-1],
-            {
-                "role": "assistant",
-                "content": [{"type": "text", "text": "2"}],
-            },
+            full_conversation[-1], {"role": "assistant", "content": "2"}
         )
-        self.assertEqual(full_conversation[0]["content"][0]["type"], "text")
-        np.testing.assert_array_equal(batch["labels"], [[-100, -100, -100, -100, 5]])
+        np.testing.assert_array_equal(
+            batch["labels"], [[-100, -100, -100, -100, -100, 6]]
+        )
+        self.assertEqual(processor.calls[0][1]["padding_side"], "right")
+        self.assertEqual(processor.calls[0][1]["max_length"], 2048)
 
-    def test_generation_collator_excludes_answer(self) -> None:
+    def test_generation_collator_excludes_answer_and_left_pads(self) -> None:
         processor = _FakeProcessor()
         batch = GenerationCollator(processor)([self.dataset[0]])
-        conversation = processor.calls[0][0][0]
-        self.assertEqual([message["role"] for message in conversation], ["system", "user"])
-        self.assertEqual(conversation[0]["content"][0]["type"], "text")
-        self.assertTrue(
-            all(isinstance(message["content"], list) for message in conversation)
+        conversation = processor.calls[0][0][0]["conv"]
+        self.assertEqual(
+            [message["role"] for message in conversation],
+            ["system", "user", "user"],
         )
         self.assertNotIn("labels", batch)
         self.assertTrue(processor.calls[0][1]["add_generation_prompt"])
+        self.assertEqual(processor.calls[0][1]["padding_side"], "left")
 
     def test_train_collator_rejects_missing_answer(self) -> None:
         processor = _FakeProcessor()

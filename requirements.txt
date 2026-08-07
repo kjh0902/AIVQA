@@ -4,11 +4,12 @@ transformers>=4.57.0,<5.0.0
 accelerate>=1.0.0,<2.0.0
 Pillow>=10.0.0,<13.0.0
 safetensors>=0.4.3,<1.0.0
+einops>=0.8.0,<1.0.0
+timm>=1.0.0,<2.0.0
+omegaconf>=2.3.0,<3.0.0
 numpy>=1.26.0,<3.0.0
 pandas>=2.0.0,<3.0.0
 peft>=0.17.0,<1.0.0
 matplotlib>=3.8.0,<4.0.0
 tqdm>=4.66.0,<5.0.0
 bitsandbytes>=0.46.0,<1.0.0; platform_system == "Linux"
-# Keep the existing paddlepaddle-gpu 3.3.0 CUDA build installed from Paddle's index.
-paddleocr>=3.3.2,<3.4.0

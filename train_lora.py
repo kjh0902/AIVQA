@@ -1,4 +1,4 @@
-"""LoRA/DoRA fine-tuning, validation, and test generation for Qwen3-VL."""
+"""Kanana-V LLM-only LoRA fine-tuning, validation, and test generation."""
 
 from __future__ import annotations
 
@@ -8,33 +8,36 @@ import math
 import random
 import re
 import time
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-from aivqa.data import GenerationCollator, QwenVQADataset, TrainCollator
+from aivqa.data import GenerationCollator, KananaVQADataset, TrainCollator
 from aivqa.metrics import compute_vqa_metrics
 from training_logger import TrainingLogger
 
 
-MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
+MODEL_ID = "kakaocorp/kanana-1.5-v-3b-instruct"
 DATASET_NAME = "한국문화 멀티모달 질의응답"
 DATASET_DIR = Path("datasets") / DATASET_NAME
 TEST_PREDICTIONS_NAME = f"{DATASET_NAME}_test_predictions.json"
-EXPECTED_DECODER_LAYERS = 36
+
+EXPECTED_DECODER_LAYERS = 32
 PROJECTION_NAMES = ("q_proj", "k_proj", "v_proj", "o_proj")
-IMAGE_COMPRESSION_FACTOR = 32
-DEFAULT_MIN_PIXELS = 64 * IMAGE_COMPRESSION_FACTOR * IMAGE_COMPRESSION_FACTOR
-DEFAULT_MAX_PIXELS = 1024 * IMAGE_COMPRESSION_FACTOR * IMAGE_COMPRESSION_FACTOR
+IMAGE_COMPRESSION_FACTOR = 28
+DEFAULT_MIN_PIXELS = 100 * IMAGE_COMPRESSION_FACTOR**2
+DEFAULT_MAX_PIXELS = 400 * IMAGE_COMPRESSION_FACTOR**2
+MODEL_MAX_PIXELS = 1600 * IMAGE_COMPRESSION_FACTOR**2
 TARGET_PATTERN = re.compile(
-    r"^model\.language_model\.layers\.(\d+)\.self_attn\."
+    r"^model\.layers\.(\d+)\.self_attn\."
     r"(q_proj|k_proj|v_proj|o_proj)$"
 )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Fine-tune Qwen3-VL-8B-Instruct with LoRA or DoRA."
+        description="Fine-tune Kanana-1.5-V-3B with LLM-only LoRA."
     )
     parser.add_argument("--model-id", default=MODEL_ID)
     parser.add_argument(
@@ -52,13 +55,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("outputs/qwen3_vl_lora"),
+        default=Path("outputs/kanana_1_5_v_3b_lora"),
         help="Root directory where a unique run_YYYYMMDD_HHMMSS folder is created",
     )
     parser.add_argument(
         "--test-predictions-path",
         type=Path,
-        help="Default: RUN_OUTPUT_DIR/한국문화 멀티모달 질의응답_test_predictions.json",
+        help=f"Default: RUN_OUTPUT_DIR/{TEST_PREDICTIONS_NAME}",
     )
 
     parser.add_argument("--epochs", type=int, default=5)
@@ -70,6 +73,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-ratio", type=float, default=0.10)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--early-stopping-patience", type=int, default=2)
+    parser.add_argument("--max-length", type=int, default=2048)
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
@@ -77,35 +81,30 @@ def parse_args() -> argparse.Namespace:
         "--min-pixels",
         type=int,
         default=DEFAULT_MIN_PIXELS,
-        help="Minimum pixels per image before Qwen3-VL processing",
+        help="Minimum image pixels after Kanana preprocessing",
     )
     parser.add_argument(
         "--max-pixels",
         type=int,
         default=DEFAULT_MAX_PIXELS,
-        help="Maximum pixels per image before Qwen3-VL processing",
+        help="Maximum image pixels after Kanana preprocessing",
     )
 
-    # Adapter defaults are kept together here so they are easy to modify.
     parser.add_argument("--lora-r", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
     parser.add_argument(
-        "--use-dora",
-        action="store_true",
-        help="Use DoRA instead of the default LoRA adapter",
-    )
-
-    parser.add_argument(
         "--dtype", choices=("bfloat16", "float16"), default="bfloat16"
     )
     parser.add_argument(
-        "--attn-implementation", choices=("sdpa", "flash_attention_2"), default="sdpa"
+        "--attn-implementation",
+        choices=("sdpa", "flash_attention_2"),
+        default="sdpa",
     )
     parser.add_argument(
         "--load-in-4bit",
         action="store_true",
-        help="Quantize frozen base weights to 4-bit (recommended for limited VRAM)",
+        help="Use 4-bit frozen base weights when BF16 does not fit in VRAM",
     )
     parser.add_argument(
         "--gradient-checkpointing",
@@ -125,6 +124,7 @@ def validate_args(args: argparse.Namespace) -> None:
         "eval_batch_size",
         "gradient_accumulation_steps",
         "early_stopping_patience",
+        "max_length",
         "max_new_tokens",
         "lora_r",
         "lora_alpha",
@@ -140,10 +140,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("learning rate and max grad norm must be positive")
     if args.num_workers < 0:
         raise ValueError("--num-workers cannot be negative")
-    if args.min_pixels < 1 or args.max_pixels < 1:
-        raise ValueError("--min-pixels and --max-pixels must be positive")
-    if args.max_pixels < args.min_pixels:
-        raise ValueError("--max-pixels must be greater than or equal to --min-pixels")
+    if args.min_pixels < 1 or args.max_pixels < args.min_pixels:
+        raise ValueError("Expected 0 < min_pixels <= max_pixels")
+    if args.max_pixels > MODEL_MAX_PIXELS:
+        raise ValueError(
+            f"--max-pixels cannot exceed the model processor limit ({MODEL_MAX_PIXELS})"
+        )
 
 
 def set_seed(seed: int) -> None:
@@ -176,7 +178,7 @@ def create_run_output_dir(
 
 
 def find_adapter_target_modules(module_names: Iterable[str]) -> list[str]:
-    """Return and validate all 36 x 4 language self-attention projections."""
+    """Return and validate every LLM self-attention projection."""
     targets: list[str] = []
     found: dict[int, set[str]] = {}
     for name in module_names:
@@ -193,7 +195,7 @@ def find_adapter_target_modules(module_names: Iterable[str]) -> list[str]:
         missing = sorted(expected_layers - set(found))
         extra = sorted(set(found) - expected_layers)
         raise RuntimeError(
-            f"Unexpected Qwen decoder layers; missing={missing}, extra={extra}"
+            f"Unexpected Kanana decoder layers; missing={missing}, extra={extra}"
         )
     expected_projections = set(PROJECTION_NAMES)
     incomplete = {
@@ -201,7 +203,8 @@ def find_adapter_target_modules(module_names: Iterable[str]) -> list[str]:
         for layer, projections in found.items()
         if projections != expected_projections
     }
-    if incomplete or len(targets) != EXPECTED_DECODER_LAYERS * len(PROJECTION_NAMES):
+    expected_count = EXPECTED_DECODER_LAYERS * len(PROJECTION_NAMES)
+    if incomplete or len(targets) != expected_count:
         raise RuntimeError(f"Incomplete adapter projection set: {incomplete}")
     return sorted(targets)
 
@@ -209,36 +212,68 @@ def find_adapter_target_modules(module_names: Iterable[str]) -> list[str]:
 def configure_image_pixel_limits(
     processor: Any, min_pixels: int, max_pixels: int
 ) -> None:
-    """Set one shared image pixel budget on the official Qwen3-VL processor."""
+    """Configure the attributes used by the native Kanana image processor."""
     if not hasattr(processor, "image_processor"):
         raise TypeError("The loaded processor does not expose an image_processor")
     if min_pixels < 1 or max_pixels < min_pixels:
         raise ValueError("Expected 0 < min_pixels <= max_pixels")
-    processor.image_processor.size = {
-        "shortest_edge": int(min_pixels),
-        "longest_edge": int(max_pixels),
+
+    image_processor = processor.image_processor
+    image_processor.min_pixels = int(min_pixels)
+    image_processor.max_pixels = int(max_pixels)
+    image_processor.size = {
+        "min_pixels": int(min_pixels),
+        "max_pixels": int(max_pixels),
     }
+
+
+def _prepare_llm_for_training(
+    model: Any, load_in_4bit: bool, gradient_checkpointing: bool
+) -> Any:
+    """Prepare only the language model, leaving both visual modules frozen."""
+    llm = model.language_model
+    if load_in_4bit:
+        from peft import prepare_model_for_kbit_training
+
+        # Quantization metadata is attached to the multimodal wrapper by
+        # Transformers. PEFT needs the same flag on the LLM submodule.
+        for attribute in ("is_loaded_in_4bit", "is_loaded_in_8bit"):
+            if hasattr(model, attribute):
+                setattr(llm, attribute, getattr(model, attribute))
+        llm = prepare_model_for_kbit_training(
+            llm,
+            use_gradient_checkpointing=False,
+        )
+    if gradient_checkpointing:
+        llm.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+    return llm
 
 
 def build_model_and_processor(args: argparse.Namespace) -> tuple[Any, Any, Any]:
     import torch
-    from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
-    from transformers import AutoProcessor, BitsAndBytesConfig, Qwen3VLForConditionalGeneration
+    from peft import LoraConfig, TaskType, get_peft_model
+    from transformers import AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConfig
 
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA GPU is required for Qwen3-VL-8B training")
+        raise RuntimeError("A CUDA GPU is required for Kanana-V training")
 
     dtype = getattr(torch, args.dtype)
-    processor = AutoProcessor.from_pretrained(args.model_id)
+    print(f"Loading processor: {args.model_id}")
+    processor = AutoProcessor.from_pretrained(
+        args.model_id,
+        trust_remote_code=True,
+    )
     configure_image_pixel_limits(processor, args.min_pixels, args.max_pixels)
     if processor.tokenizer.pad_token_id is None:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
-    processor.tokenizer.padding_side = "right"
 
     model_kwargs: dict[str, Any] = {
         "dtype": dtype,
-        "device_map": "auto",
+        "device_map": {"": torch.cuda.current_device()},
         "low_cpu_mem_usage": True,
+        "trust_remote_code": True,
         "attn_implementation": args.attn_implementation,
     }
     if args.load_in_4bit:
@@ -254,28 +289,22 @@ def build_model_and_processor(args: argparse.Namespace) -> tuple[Any, Any, Any]:
         f"(~{args.min_pixels // IMAGE_COMPRESSION_FACTOR**2}-"
         f"{args.max_pixels // IMAGE_COMPRESSION_FACTOR**2} visual tokens)"
     )
-    print(f"Loading processor and model: {args.model_id}")
-    model = Qwen3VLForConditionalGeneration.from_pretrained(
-        args.model_id, **model_kwargs
-    )
+    print(f"Loading model: {args.model_id}")
+    model = AutoModelForVision2Seq.from_pretrained(args.model_id, **model_kwargs)
+    for required_module in ("vision_model", "abstractor", "language_model"):
+        if not hasattr(model, required_module):
+            raise TypeError(f"Kanana model is missing required module: {required_module}")
+
     model.requires_grad_(False)
     model.config.use_cache = False
+    model.language_model.config.use_cache = False
 
-    if args.load_in_4bit:
-        model = prepare_model_for_kbit_training(
-            model,
-            use_gradient_checkpointing=args.gradient_checkpointing,
-            gradient_checkpointing_kwargs={"use_reentrant": False},
-        )
-    elif args.gradient_checkpointing:
-        model.gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs={"use_reentrant": False}
-        )
-        model.enable_input_require_grads()
-
-    target_modules = find_adapter_target_modules(
-        name for name, _ in model.named_modules()
+    llm = _prepare_llm_for_training(
+        model,
+        load_in_4bit=args.load_in_4bit,
+        gradient_checkpointing=args.gradient_checkpointing,
     )
+    target_modules = find_adapter_target_modules(name for name, _ in llm.named_modules())
     adapter_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
         r=args.lora_r,
@@ -283,41 +312,75 @@ def build_model_and_processor(args: argparse.Namespace) -> tuple[Any, Any, Any]:
         lora_dropout=args.lora_dropout,
         target_modules=target_modules,
         bias="none",
-        use_dora=args.use_dora,
     )
-    model = get_peft_model(model, adapter_config)
-    _verify_only_adapters_are_trainable(model)
-    model.print_trainable_parameters()
+    peft_llm = get_peft_model(llm, adapter_config)
+    # PEFT normally makes embedding outputs require gradients when checkpointing
+    # is enabled. Kanana replaces image placeholder embeddings in-place, which
+    # is incompatible with a leaf embedding tensor. Non-reentrant checkpointing
+    # does not need that hook to compute LoRA parameter gradients.
+    if hasattr(llm, "_require_grads_hook"):
+        llm.disable_input_require_grads()
+    model.language_model = peft_llm
+    _verify_only_llm_adapters_are_trainable(model)
+    model.language_model.print_trainable_parameters()
     return model, processor, dtype
 
 
-def _verify_only_adapters_are_trainable(model: Any) -> None:
-    trainable = [(name, parameter) for name, parameter in model.named_parameters() if parameter.requires_grad]
-    if not trainable:
-        raise RuntimeError("No trainable adapter parameters were created")
-
-    target_path = re.compile(
-        r"model\.language_model\.layers\.(?:[0-9]|[12][0-9]|3[0-5])\."
-        r"self_attn\.(?:q_proj|k_proj|v_proj|o_proj)\."
-    )
-    invalid = [
-        name
-        for name, _ in trainable
-        if ".lora_" not in name or target_path.search(name) is None
+def _verify_only_llm_adapters_are_trainable(model: Any) -> None:
+    trainable_names = [
+        name for name, parameter in model.named_parameters() if parameter.requires_grad
     ]
+    if not trainable_names:
+        raise RuntimeError("No trainable LoRA parameters were created")
+
+    adapted_targets: set[tuple[int, str]] = set()
+    target_path = re.compile(
+        r"\.model\.layers\.(\d+)\.self_attn\."
+        r"(q_proj|k_proj|v_proj|o_proj)\."
+    )
+    invalid = []
+    for name in trainable_names:
+        match = target_path.search(name)
+        if (
+            not name.startswith("language_model.")
+            or ".lora_" not in name
+            or match is None
+        ):
+            invalid.append(name)
+        else:
+            adapted_targets.add((int(match.group(1)), match.group(2)))
+
     if invalid:
         raise RuntimeError(
-            "Non-adapter or out-of-scope parameters are trainable: " + ", ".join(invalid[:10])
+            "Non-LoRA or out-of-scope parameters are trainable: "
+            + ", ".join(invalid[:10])
         )
+    expected_target_count = EXPECTED_DECODER_LAYERS * len(PROJECTION_NAMES)
+    if len(adapted_targets) != expected_target_count:
+        raise RuntimeError(
+            f"Expected {expected_target_count} adapted LLM projections, "
+            f"found {len(adapted_targets)}"
+        )
+    for module_name in ("vision_model", "abstractor"):
+        module = getattr(model, module_name)
+        if any(parameter.requires_grad for parameter in module.parameters()):
+            raise RuntimeError(f"{module_name} must remain frozen")
 
 
-def _move_batch_to_model(batch: Any, model: Any) -> Any:
-    if hasattr(batch, "to"):
-        return batch.to(model.device)
-    return {
-        key: value.to(model.device) if hasattr(value, "to") else value
-        for key, value in batch.items()
-    }
+def _model_input_device(model: Any) -> Any:
+    return next(model.vision_model.parameters()).device
+
+
+def _move_batch_to_device(value: Any, device: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _move_batch_to_device(item, device) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_move_batch_to_device(item, device) for item in value)
+    if isinstance(value, list):
+        return [_move_batch_to_device(item, device) for item in value]
+    if hasattr(value, "to"):
+        return value.to(device, non_blocking=True)
+    return value
 
 
 def train_one_epoch(
@@ -334,20 +397,22 @@ def train_one_epoch(
     from tqdm.auto import tqdm
 
     model.train()
+    model.vision_model.eval()
+    model.abstractor.eval()
     optimizer.zero_grad(set_to_none=True)
     loss_sum = 0.0
     token_count = 0
     progress = tqdm(loader, desc="train", leave=False)
+    device = _model_input_device(model)
 
     for step, batch in enumerate(progress):
-        batch = _move_batch_to_model(batch, model)
+        batch = _move_batch_to_device(batch, device)
         target_tokens = int((batch["labels"] != -100).sum().item())
         group_start = (step // gradient_accumulation_steps) * gradient_accumulation_steps
         group_size = min(gradient_accumulation_steps, len(loader) - group_start)
 
         with torch.autocast(device_type="cuda", dtype=dtype):
-            outputs = model(**batch, use_cache=False)
-            loss = outputs.loss
+            loss = model(**batch).loss
         scaler.scale(loss / group_size).backward()
         loss_sum += float(loss.detach().item()) * target_tokens
         token_count += target_tokens
@@ -376,12 +441,13 @@ def evaluate_loss(model: Any, loader: Any, dtype: Any) -> float:
     model.eval()
     loss_sum = 0.0
     token_count = 0
-    with torch.inference_mode():
+    device = _model_input_device(model)
+    with torch.no_grad():
         for batch in loader:
-            batch = _move_batch_to_model(batch, model)
+            batch = _move_batch_to_device(batch, device)
             target_tokens = int((batch["labels"] != -100).sum().item())
             with torch.autocast(device_type="cuda", dtype=dtype):
-                loss = model(**batch, use_cache=False).loss
+                loss = model(**batch).loss
             loss_sum += float(loss.item()) * target_tokens
             token_count += target_tokens
     if token_count == 0:
@@ -389,7 +455,9 @@ def evaluate_loss(model: Any, loader: Any, dtype: Any) -> float:
     return loss_sum / token_count
 
 
-def _feature_batches(dataset: QwenVQADataset, batch_size: int) -> Iterable[list[dict[str, Any]]]:
+def _feature_batches(
+    dataset: KananaVQADataset, batch_size: int
+) -> Iterable[list[dict[str, Any]]]:
     for start in range(0, len(dataset), batch_size):
         yield [dataset[index] for index in range(start, min(start + batch_size, len(dataset)))]
 
@@ -397,8 +465,9 @@ def _feature_batches(dataset: QwenVQADataset, batch_size: int) -> Iterable[list[
 def generate_predictions(
     model: Any,
     processor: Any,
-    dataset: QwenVQADataset,
+    dataset: KananaVQADataset,
     batch_size: int,
+    max_length: int,
     max_new_tokens: int,
     dtype: Any,
 ) -> list[str]:
@@ -406,56 +475,58 @@ def generate_predictions(
     from tqdm.auto import tqdm
 
     model.eval()
-    collator = GenerationCollator(processor)
+    collator = GenerationCollator(processor, max_length=max_length)
     predictions: list[str] = []
-    previous_padding_side = processor.tokenizer.padding_side
-    processor.tokenizer.padding_side = "left"
     total_batches = math.ceil(len(dataset) / batch_size)
-    try:
-        with torch.inference_mode():
-            for features in tqdm(
-                _feature_batches(dataset, batch_size),
-                total=total_batches,
-                desc="generate",
-                leave=False,
-            ):
-                batch = collator(features)
-                prompt_width = batch["input_ids"].shape[1]
-                batch = _move_batch_to_model(batch, model)
-                with torch.autocast(device_type="cuda", dtype=dtype):
-                    generated_ids = model.generate(
-                        **batch,
-                        max_new_tokens=max_new_tokens,
-                        do_sample=False,
-                        num_beams=1,
-                        use_cache=True,
-                        pad_token_id=processor.tokenizer.pad_token_id,
-                        eos_token_id=processor.tokenizer.eos_token_id,
-                    )
-                answer_ids = generated_ids[:, prompt_width:].detach().cpu()
-                predictions.extend(
-                    answer.strip()
-                    for answer in processor.batch_decode(
-                        answer_ids,
-                        skip_special_tokens=True,
-                        clean_up_tokenization_spaces=False,
-                    )
+    device = _model_input_device(model)
+    with torch.no_grad():
+        for features in tqdm(
+            _feature_batches(dataset, batch_size),
+            total=total_batches,
+            desc="generate",
+            leave=False,
+        ):
+            batch = _move_batch_to_device(collator(features), device)
+            with torch.autocast(device_type="cuda", dtype=dtype):
+                generated_ids = model.generate(
+                    **batch,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    num_beams=1,
+                    use_cache=True,
+                    pad_token_id=processor.tokenizer.pad_token_id,
+                    eos_token_id=processor.tokenizer.eos_token_id,
                 )
-    finally:
-        processor.tokenizer.padding_side = previous_padding_side
+            # The native multimodal generate path passes inputs_embeds to the
+            # LLM, so it returns answer token IDs without the prompt prefix.
+            predictions.extend(
+                answer.strip()
+                for answer in processor.batch_decode(
+                    generated_ids.detach().cpu(),
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
+                )
+            )
     return predictions
 
 
 def evaluate_generation(
     model: Any,
     processor: Any,
-    dataset: QwenVQADataset,
+    dataset: KananaVQADataset,
     batch_size: int,
+    max_length: int,
     max_new_tokens: int,
     dtype: Any,
 ) -> tuple[list[str], dict[str, float]]:
     predictions = generate_predictions(
-        model, processor, dataset, batch_size, max_new_tokens, dtype
+        model,
+        processor,
+        dataset,
+        batch_size,
+        max_length,
+        max_new_tokens,
+        dtype,
     )
     references = []
     question_forms = []
@@ -468,47 +539,53 @@ def evaluate_generation(
     return predictions, compute_vqa_metrics(predictions, references, question_forms)
 
 
-def save_best_checkpoint(
+def save_best_adapter(
     model: Any,
-    path: Path,
+    adapter_dir: Path,
     epoch: int,
     best_score: float,
     metrics: dict[str, float],
     args: argparse.Namespace,
 ) -> None:
-    import torch
-    from peft import get_peft_model_state_dict
-
-    adapter_state = {
-        key: value.detach().cpu()
-        for key, value in get_peft_model_state_dict(model).items()
-    }
+    """Save a standard PEFT adapter directory, never the full VLM weights."""
+    adapter_dir.mkdir(parents=True, exist_ok=True)
+    model.language_model.save_pretrained(
+        adapter_dir,
+        safe_serialization=True,
+        save_embedding_layers=False,
+    )
     serialized_args = {
         key: str(value) if isinstance(value, Path) else value
         for key, value in vars(args).items()
     }
-    payload = {
-        "epoch": epoch,
+    metadata = {
+        "epoch": int(epoch),
         "best_score": float(best_score),
-        "metrics": metrics,
+        "metrics": {key: float(value) for key, value in metrics.items()},
         "args": serialized_args,
-        "adapter_state_dict": adapter_state,
+        "adapter_scope": "language_model_only",
+        "frozen_modules": ["vision_model", "abstractor"],
     }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = path.with_suffix(path.suffix + ".tmp")
-    torch.save(payload, temporary_path)
-    temporary_path.replace(path)
+    metadata_path = adapter_dir / "training_metadata.json"
+    temporary_path = metadata_path.with_suffix(".json.tmp")
+    temporary_path.write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    temporary_path.replace(metadata_path)
 
 
-def load_best_checkpoint(model: Any, path: Path) -> dict[str, Any]:
-    import torch
-    from peft import set_peft_model_state_dict
+def load_best_adapter(model: Any, adapter_dir: Path) -> dict[str, Any]:
+    from peft.utils.save_and_load import (
+        load_peft_weights,
+        set_peft_model_state_dict,
+    )
 
-    if not path.is_file():
-        raise FileNotFoundError(f"Best checkpoint does not exist: {path}")
-    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    set_peft_model_state_dict(model, checkpoint["adapter_state_dict"])
-    return checkpoint
+    metadata_path = adapter_dir / "training_metadata.json"
+    if not metadata_path.is_file():
+        raise FileNotFoundError(f"Best adapter metadata does not exist: {metadata_path}")
+    adapter_state = load_peft_weights(str(adapter_dir), device="cpu")
+    set_peft_model_state_dict(model.language_model, adapter_state)
+    return json.loads(metadata_path.read_text(encoding="utf-8"))
 
 
 def save_test_predictions(
@@ -550,13 +627,11 @@ def main() -> int:
     print(f"Run output directory: {args.output_dir}")
     predictions_path = args.test_predictions_path or args.output_dir / TEST_PREDICTIONS_NAME
 
-    train_dataset = QwenVQADataset(args.train_json, dataset_root=args.dataset_root)
-    validation_dataset = QwenVQADataset(
+    train_dataset = KananaVQADataset(args.train_json, dataset_root=args.dataset_root)
+    validation_dataset = KananaVQADataset(
         args.validation_json, dataset_root=args.dataset_root
     )
-    test_dataset = QwenVQADataset(args.test_json, dataset_root=args.dataset_root)
-    # The same configured processor instance is shared by every train/validation/test
-    # collator, so all image inputs use exactly the same pixel limits.
+    test_dataset = KananaVQADataset(args.test_json, dataset_root=args.dataset_root)
     model, processor, dtype = build_model_and_processor(args)
 
     train_loader = DataLoader(
@@ -565,7 +640,7 @@ def main() -> int:
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True,
-        collate_fn=TrainCollator(processor),
+        collate_fn=TrainCollator(processor, max_length=args.max_length),
     )
     validation_loss_loader = DataLoader(
         validation_dataset,
@@ -573,7 +648,7 @@ def main() -> int:
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=True,
-        collate_fn=TrainCollator(processor),
+        collate_fn=TrainCollator(processor, max_length=args.max_length),
     )
 
     trainable_parameters = [
@@ -594,12 +669,10 @@ def main() -> int:
         num_warmup_steps=warmup_steps,
         num_training_steps=total_updates,
     )
-    scaler = torch.amp.GradScaler(
-        "cuda", enabled=args.dtype == "float16"
-    )
+    scaler = torch.amp.GradScaler("cuda", enabled=args.dtype == "float16")
 
     logger = TrainingLogger(args.output_dir)
-    best_checkpoint_path = args.output_dir / "best_epoch.pth"
+    best_adapter_dir = args.output_dir / "best_adapter"
     best_score = float("-inf")
     epochs_without_improvement = 0
     started_at = time.monotonic()
@@ -622,6 +695,7 @@ def main() -> int:
             processor,
             validation_dataset,
             args.eval_batch_size,
+            args.max_length,
             args.max_new_tokens,
             dtype,
         )
@@ -631,9 +705,9 @@ def main() -> int:
         if is_best:
             best_score = final_score
             epochs_without_improvement = 0
-            save_best_checkpoint(
+            save_best_adapter(
                 model,
-                best_checkpoint_path,
+                best_adapter_dir,
                 epoch,
                 best_score,
                 validation_metrics,
@@ -661,9 +735,9 @@ def main() -> int:
             )
             break
 
-    checkpoint = load_best_checkpoint(model, best_checkpoint_path)
+    checkpoint = load_best_adapter(model, best_adapter_dir)
     print(
-        f"Loaded best epoch {checkpoint['epoch']} "
+        f"Loaded best adapter from epoch {checkpoint['epoch']} "
         f"(final_score={checkpoint['best_score']:.6f})"
     )
 
@@ -672,11 +746,13 @@ def main() -> int:
         processor,
         test_dataset,
         args.eval_batch_size,
+        args.max_length,
         args.max_new_tokens,
         dtype,
     )
     save_test_predictions(args.test_json, test_predictions, predictions_path)
     print(f"Saved test predictions: {predictions_path}")
+    print(f"Saved LoRA adapter: {best_adapter_dir}")
     return 0
 
 

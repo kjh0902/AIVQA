@@ -54,7 +54,7 @@ SUMMARY_COLUMNS = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Analyze AIVQA image dimensions and Qwen max_pixels coverage."
+        description="Analyze AIVQA image dimensions and Kanana max_pixels coverage."
     )
     parser.add_argument(
         "--train-json", type=Path, default=DATASET_DIR / f"{DATASET_NAME}_train.json"

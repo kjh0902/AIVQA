@@ -10,7 +10,7 @@ from generate_zero_shot import (
     parse_args,
     validate_args,
 )
-from train_lora import DEFAULT_MAX_PIXELS, parse_args as parse_training_args
+from train_lora import MODEL_MAX_PIXELS, parse_args as parse_training_args
 
 
 class ZeroShotUtilitiesTest(unittest.TestCase):
@@ -22,6 +22,7 @@ class ZeroShotUtilitiesTest(unittest.TestCase):
 
         self.assertEqual(zero_shot_args.model_id, training_args.model_id)
         self.assertEqual(zero_shot_args.eval_batch_size, training_args.eval_batch_size)
+        self.assertEqual(zero_shot_args.max_length, training_args.max_length)
         self.assertEqual(zero_shot_args.max_new_tokens, training_args.max_new_tokens)
         self.assertEqual(zero_shot_args.min_pixels, training_args.min_pixels)
         self.assertEqual(zero_shot_args.max_pixels, training_args.max_pixels)
@@ -50,7 +51,7 @@ class ZeroShotUtilitiesTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "eval-batch-size"):
                 validate_args(args)
 
-    def test_max_pixels_cannot_exceed_training_default(self) -> None:
+    def test_max_pixels_cannot_exceed_model_processor_limit(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             test_json = Path(temp_dir) / "test.json"
             test_json.write_text("[]", encoding="utf-8")
@@ -61,11 +62,11 @@ class ZeroShotUtilitiesTest(unittest.TestCase):
                     "--test-json",
                     str(test_json),
                     "--max-pixels",
-                    str(DEFAULT_MAX_PIXELS + 1),
+                    str(MODEL_MAX_PIXELS + 1),
                 ],
             ):
                 args = parse_args()
-            with self.assertRaisesRegex(ValueError, "DEFAULT_MAX_PIXELS"):
+            with self.assertRaisesRegex(ValueError, "MODEL_MAX_PIXELS"):
                 validate_args(args)
 
 
