@@ -172,13 +172,7 @@ python infer_single_image.py \
 두 경로 모두 공식 processor의 `batch_encode_collate`와 왼쪽 padding을 사용하며,
 학습과 동일한 이미지 pixel 제한을 적용합니다.
 
-## 이미지 크기 분석과 테스트
-
-데이터 이미지를 모델 로드 없이 분석합니다.
-
-```bash
-python analyze_image_pixels.py
-```
+## 테스트
 
 단위 테스트는 모델 weight를 다운로드하지 않고 실행됩니다.
 
