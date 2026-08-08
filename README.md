@@ -1,16 +1,16 @@
 # Kanana-V 한국문화 멀티모달 질의응답 LoRA baseline
 
 `kakaocorp/kanana-1.5-v-3b-instruct`로 한국문화 멀티모달 질의응답 데이터의
-MC·SA·LA 전체 유형을 학습하는 LLM-only LoRA 구현입니다.
+MC·SA·LA 전체 유형을 학습하는 multimodal LoRA 구현입니다.
 
 학습 범위는 다음과 같습니다.
 
 ```text
 Image
   ↓
-Kanana Vision Encoder       [Frozen]
+Kanana Vision Encoder       [Frozen base weights + Attention LoRA]
   ↓
-Kanana C-Abstractor         [Frozen]
+Kanana C-Abstractor         [Frozen base weights + Readout LoRA]
   ↓
 Kanana LLM                  [Frozen base weights + LoRA]
   ↓
@@ -18,8 +18,10 @@ Answer
 ```
 
 공식 모델 구현의 `vision_model`, `abstractor`, `language_model` 경계를 그대로
-사용합니다. LoRA는 32개 LLM decoder layer의 `q_proj`, `k_proj`, `v_proj`,
-`o_proj` 128개에만 적용하며, 실행 시 trainable parameter 범위를 검사합니다.
+사용합니다. LoRA는 LLM attention의 `q_proj`, `k_proj`, `v_proj`, `o_proj`
+128개, Vision attention의 `qkv`, `proj` 64개, C-Abstractor readout Linear
+2개를 합친 총 194개 모듈에 적용하며, 실행 시 trainable parameter 범위를
+검사합니다.
 
 ## 환경 준비
 
@@ -133,7 +135,8 @@ outputs/kanana_1_5_v_3b_lora/run_YYYYMMDD_HHMMSS/
 └── 한국문화 멀티모달 질의응답_test_predictions.json
 ```
 
-저장된 adapter는 전체 VLM이 아니라 `language_model`에 다시 연결합니다.
+저장된 adapter에는 전체 base weight가 아니라 194개 대상의 LoRA weight만 들어
+있으며, 추론할 때 전체 VLM에 다시 연결합니다.
 
 ```python
 from peft import PeftModel
@@ -144,8 +147,8 @@ model = AutoModelForVision2Seq.from_pretrained(
     trust_remote_code=True,
     device_map="auto",
 )
-model.language_model = PeftModel.from_pretrained(
-    model.language_model,
+model = PeftModel.from_pretrained(
+    model,
     "outputs/kanana_1_5_v_3b_lora/run_YYYYMMDD_HHMMSS/best_adapter",
 )
 ```

@@ -15,6 +15,7 @@ from train_lora import (
     DATASET_NAME,
     DEFAULT_MAX_PIXELS,
     DEFAULT_MIN_PIXELS,
+    EXPECTED_ADAPTER_TARGET_COUNT,
     MODEL_ID,
     MODEL_MAX_PIXELS,
     create_run_output_dir,
@@ -160,7 +161,7 @@ def save_type_adapter(
     args: argparse.Namespace,
 ) -> None:
     adapter_dir.mkdir(parents=True, exist_ok=True)
-    model.language_model.save_pretrained(
+    model.save_pretrained(
         adapter_dir,
         safe_serialization=True,
         save_embedding_layers=False,
@@ -174,8 +175,9 @@ def save_type_adapter(
         "args": _serialized_args(args),
         "continued_from_shared_adapter": True,
         "shared_adapter_dir": str(args.shared_adapter_dir.resolve()),
-        "adapter_scope": "language_model_only",
-        "frozen_modules": ["vision_model", "abstractor"],
+        "adapter_scope": "llm_and_vision_attention_with_abstractor_readout",
+        "target_module_count": EXPECTED_ADAPTER_TARGET_COUNT,
+        "frozen_base_weights": True,
         "merge_and_reinitialize": False,
     }
     metadata_path = adapter_dir / "training_metadata.json"

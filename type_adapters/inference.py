@@ -114,7 +114,7 @@ def main() -> int:
                 f"Generating {len(subsets[question_form])} {question_form} samples "
                 f"with {adapter_dirs[question_form]}"
             )
-            model.language_model.set_adapter(question_form)
+            model.set_adapter(question_form)
             model.eval()
             grouped_predictions[question_form] = generate_predictions(
                 model,
