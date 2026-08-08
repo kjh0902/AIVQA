@@ -11,7 +11,7 @@ from typing import Any
 from train_lora import (
     IMAGE_COMPRESSION_FACTOR,
     _prepare_llm_for_training,
-    _verify_multimodal_adapters_are_trainable,
+    _verify_only_llm_adapters_are_trainable,
     configure_image_pixel_limits,
 )
 
@@ -64,18 +64,18 @@ def validate_type_adapter_set(
     return adapter_dirs
 
 
-def load_trainable_shared_adapter(model: Any, shared_adapter_dir: str | Path) -> Any:
+def load_trainable_shared_adapter(llm: Any, shared_adapter_dir: str | Path) -> Any:
     """Load the Shared LoRA itself as trainable weights without merging it."""
     from peft import PeftModel
 
     path = validate_adapter_checkpoint(shared_adapter_dir)
-    return PeftModel.from_pretrained(model, str(path), is_trainable=True)
+    return PeftModel.from_pretrained(llm, str(path), is_trainable=True)
 
 
 def load_switchable_type_adapters(
-    model: Any, adapter_dirs: Mapping[str, str | Path]
+    llm: Any, adapter_dirs: Mapping[str, str | Path]
 ) -> Any:
-    """Register all three multimodal inference adapters on one model."""
+    """Register all three inference adapters on one language model."""
     from peft import PeftModel
 
     normalized_dirs = {
@@ -83,20 +83,20 @@ def load_switchable_type_adapters(
         for question_form in QUESTION_FORMS
     }
     first_form = QUESTION_FORMS[0]
-    peft_model = PeftModel.from_pretrained(
-        model,
+    peft_llm = PeftModel.from_pretrained(
+        llm,
         str(normalized_dirs[first_form]),
         adapter_name=first_form,
         is_trainable=False,
     )
     for question_form in QUESTION_FORMS[1:]:
-        peft_model.load_adapter(
+        peft_llm.load_adapter(
             str(normalized_dirs[question_form]),
             adapter_name=question_form,
             is_trainable=False,
         )
-    peft_model.set_adapter(first_form)
-    return peft_model
+    peft_llm.set_adapter(first_form)
+    return peft_llm
 
 
 def load_base_model_and_processor(
@@ -159,23 +159,23 @@ def load_base_model_and_processor(
 def attach_shared_adapter_for_training(
     model: Any, shared_adapter_dir: str | Path
 ) -> Any:
-    peft_model = load_trainable_shared_adapter(
-        model,
+    peft_llm = load_trainable_shared_adapter(
+        model.language_model,
         shared_adapter_dir,
     )
-    llm = peft_model.language_model
-    if hasattr(llm, "_require_grads_hook"):
-        llm.disable_input_require_grads()
-    _verify_multimodal_adapters_are_trainable(peft_model)
-    peft_model.print_trainable_parameters()
-    return peft_model
+    if hasattr(peft_llm, "_require_grads_hook"):
+        peft_llm.disable_input_require_grads()
+    model.language_model = peft_llm
+    _verify_only_llm_adapters_are_trainable(model)
+    model.language_model.print_trainable_parameters()
+    return model
 
 
 def attach_type_adapters_for_inference(
     model: Any, adapter_dirs: Mapping[str, str | Path]
 ) -> Any:
-    model = load_switchable_type_adapters(
-        model,
+    model.language_model = load_switchable_type_adapters(
+        model.language_model,
         adapter_dirs,
     )
     model.requires_grad_(False)

@@ -1,4 +1,4 @@
-"""Kanana-V multimodal LoRA fine-tuning, validation, and test generation."""
+"""Kanana-V LLM-only LoRA fine-tuning, validation, and test generation."""
 
 from __future__ import annotations
 
@@ -24,32 +24,20 @@ DATASET_DIR = Path("datasets") / DATASET_NAME
 TEST_PREDICTIONS_NAME = f"{DATASET_NAME}_test_predictions.json"
 
 EXPECTED_DECODER_LAYERS = 32
-EXPECTED_VISION_LAYERS = 32
-LLM_PROJECTION_NAMES = ("q_proj", "k_proj", "v_proj", "o_proj")
-VISION_ATTENTION_NAMES = ("qkv", "proj")
-ABSTRACTOR_READOUT_INDICES = (0, 2)
-EXPECTED_ADAPTER_TARGET_COUNT = (
-    EXPECTED_DECODER_LAYERS * len(LLM_PROJECTION_NAMES)
-    + EXPECTED_VISION_LAYERS * len(VISION_ATTENTION_NAMES)
-    + len(ABSTRACTOR_READOUT_INDICES)
-)
+PROJECTION_NAMES = ("q_proj", "k_proj", "v_proj", "o_proj")
 IMAGE_COMPRESSION_FACTOR = 28
 DEFAULT_MIN_PIXELS = 200 * IMAGE_COMPRESSION_FACTOR**2
 DEFAULT_MAX_PIXELS = 1600 * IMAGE_COMPRESSION_FACTOR**2
 MODEL_MAX_PIXELS = 1600 * IMAGE_COMPRESSION_FACTOR**2
-LLM_TARGET_PATTERN = re.compile(
-    r"^language_model\.model\.layers\.(\d+)\.self_attn\."
+TARGET_PATTERN = re.compile(
+    r"^model\.layers\.(\d+)\.self_attn\."
     r"(q_proj|k_proj|v_proj|o_proj)$"
 )
-VISION_TARGET_PATTERN = re.compile(
-    r"^vision_model\.blocks\.(\d+)\.attn\.(qkv|proj)$"
-)
-ABSTRACTOR_TARGET_PATTERN = re.compile(r"^abstractor\.readout\.(0|2)$")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Fine-tune Kanana-1.5-V-3B with 194 multimodal LoRA targets."
+        description="Fine-tune Kanana-1.5-V-3B with LLM-only LoRA."
     )
     parser.add_argument("--model-id", default=MODEL_ID)
     parser.add_argument(
@@ -190,64 +178,34 @@ def create_run_output_dir(
 
 
 def find_adapter_target_modules(module_names: Iterable[str]) -> list[str]:
-    """Return and validate all 194 multimodal LoRA target modules."""
+    """Return and validate every LLM self-attention projection."""
     targets: list[str] = []
-    llm_found: dict[int, set[str]] = {}
-    vision_found: dict[int, set[str]] = {}
-    abstractor_found: set[int] = set()
+    found: dict[int, set[str]] = {}
     for name in module_names:
-        if match := LLM_TARGET_PATTERN.fullmatch(name):
-            layer = int(match.group(1))
-            targets.append(name)
-            llm_found.setdefault(layer, set()).add(match.group(2))
-        elif match := VISION_TARGET_PATTERN.fullmatch(name):
-            layer = int(match.group(1))
-            targets.append(name)
-            vision_found.setdefault(layer, set()).add(match.group(2))
-        elif match := ABSTRACTOR_TARGET_PATTERN.fullmatch(name):
-            targets.append(name)
-            abstractor_found.add(int(match.group(1)))
+        match = TARGET_PATTERN.fullmatch(name)
+        if match is None:
+            continue
+        layer = int(match.group(1))
+        projection = match.group(2)
+        targets.append(name)
+        found.setdefault(layer, set()).add(projection)
 
-    expected_llm_layers = set(range(EXPECTED_DECODER_LAYERS))
-    if set(llm_found) != expected_llm_layers:
-        missing = sorted(expected_llm_layers - set(llm_found))
-        extra = sorted(set(llm_found) - expected_llm_layers)
+    expected_layers = set(range(EXPECTED_DECODER_LAYERS))
+    if set(found) != expected_layers:
+        missing = sorted(expected_layers - set(found))
+        extra = sorted(set(found) - expected_layers)
         raise RuntimeError(
             f"Unexpected Kanana decoder layers; missing={missing}, extra={extra}"
         )
-    expected_llm_projections = set(LLM_PROJECTION_NAMES)
-    incomplete_llm = {
-        layer: sorted(expected_llm_projections - projections)
-        for layer, projections in llm_found.items()
-        if projections != expected_llm_projections
+    expected_projections = set(PROJECTION_NAMES)
+    incomplete = {
+        layer: sorted(expected_projections - projections)
+        for layer, projections in found.items()
+        if projections != expected_projections
     }
-
-    expected_vision_layers = set(range(EXPECTED_VISION_LAYERS))
-    if set(vision_found) != expected_vision_layers:
-        missing = sorted(expected_vision_layers - set(vision_found))
-        extra = sorted(set(vision_found) - expected_vision_layers)
-        raise RuntimeError(
-            f"Unexpected Kanana vision layers; missing={missing}, extra={extra}"
-        )
-    expected_vision_projections = set(VISION_ATTENTION_NAMES)
-    incomplete_vision = {
-        layer: sorted(expected_vision_projections - projections)
-        for layer, projections in vision_found.items()
-        if projections != expected_vision_projections
-    }
-    expected_abstractor = set(ABSTRACTOR_READOUT_INDICES)
-    if abstractor_found != expected_abstractor:
-        raise RuntimeError(
-            "Unexpected C-Abstractor readout targets; "
-            f"missing={sorted(expected_abstractor - abstractor_found)}, "
-            f"extra={sorted(abstractor_found - expected_abstractor)}"
-        )
-    if incomplete_llm or incomplete_vision or len(targets) != EXPECTED_ADAPTER_TARGET_COUNT:
-        raise RuntimeError(
-            "Incomplete adapter target set: "
-            f"llm={incomplete_llm}, vision={incomplete_vision}, "
-            f"count={len(targets)}"
-        )
+    expected_count = EXPECTED_DECODER_LAYERS * len(PROJECTION_NAMES)
+    if incomplete or len(targets) != expected_count:
+        raise RuntimeError(f"Incomplete adapter projection set: {incomplete}")
     return sorted(targets)
 
 
@@ -272,7 +230,7 @@ def configure_image_pixel_limits(
 def _prepare_llm_for_training(
     model: Any, load_in_4bit: bool, gradient_checkpointing: bool
 ) -> Any:
-    """Prepare the language submodule for quantized training/checkpointing."""
+    """Prepare only the language model, leaving both visual modules frozen."""
     llm = model.language_model
     if load_in_4bit:
         from peft import prepare_model_for_kbit_training
@@ -295,7 +253,7 @@ def _prepare_llm_for_training(
 
 def build_model_and_processor(args: argparse.Namespace) -> tuple[Any, Any, Any]:
     import torch
-    from peft import LoraConfig, get_peft_model
+    from peft import LoraConfig, TaskType, get_peft_model
     from transformers import AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConfig
 
     if not torch.cuda.is_available():
@@ -346,67 +304,67 @@ def build_model_and_processor(args: argparse.Namespace) -> tuple[Any, Any, Any]:
         load_in_4bit=args.load_in_4bit,
         gradient_checkpointing=args.gradient_checkpointing,
     )
-    model.language_model = llm
-    target_modules = find_adapter_target_modules(
-        name for name, _ in model.named_modules()
-    )
+    target_modules = find_adapter_target_modules(name for name, _ in llm.named_modules())
     adapter_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
         target_modules=target_modules,
         bias="none",
     )
-    model = get_peft_model(model, adapter_config)
+    peft_llm = get_peft_model(llm, adapter_config)
     # PEFT normally makes embedding outputs require gradients when checkpointing
     # is enabled. Kanana replaces image placeholder embeddings in-place, which
     # is incompatible with a leaf embedding tensor. Non-reentrant checkpointing
     # does not need that hook to compute LoRA parameter gradients.
     if hasattr(llm, "_require_grads_hook"):
         llm.disable_input_require_grads()
-    _verify_multimodal_adapters_are_trainable(model)
-    model.print_trainable_parameters()
+    model.language_model = peft_llm
+    _verify_only_llm_adapters_are_trainable(model)
+    model.language_model.print_trainable_parameters()
     return model, processor, dtype
 
 
-def _verify_multimodal_adapters_are_trainable(model: Any) -> None:
+def _verify_only_llm_adapters_are_trainable(model: Any) -> None:
     trainable_names = [
         name for name, parameter in model.named_parameters() if parameter.requires_grad
     ]
     if not trainable_names:
         raise RuntimeError("No trainable LoRA parameters were created")
 
-    adapted_targets: set[str] = set()
-    target_paths = (
-        re.compile(
-            r"language_model(?:\.base_model\.model)?\.model\.layers\.(\d+)\.self_attn\."
-            r"(q_proj|k_proj|v_proj|o_proj)\."
-        ),
-        re.compile(r"vision_model\.blocks\.(\d+)\.attn\.(qkv|proj)\."),
-        re.compile(r"abstractor\.readout\.(0|2)\."),
+    adapted_targets: set[tuple[int, str]] = set()
+    target_path = re.compile(
+        r"\.model\.layers\.(\d+)\.self_attn\."
+        r"(q_proj|k_proj|v_proj|o_proj)\."
     )
     invalid = []
     for name in trainable_names:
-        match = None
-        for pattern in target_paths:
-            match = pattern.search(name)
-            if match is not None:
-                break
-        if ".lora_" not in name or match is None:
+        match = target_path.search(name)
+        if (
+            not name.startswith("language_model.")
+            or ".lora_" not in name
+            or match is None
+        ):
             invalid.append(name)
         else:
-            adapted_targets.add(match.group(0).rstrip("."))
+            adapted_targets.add((int(match.group(1)), match.group(2)))
 
     if invalid:
         raise RuntimeError(
             "Non-LoRA or out-of-scope parameters are trainable: "
             + ", ".join(invalid[:10])
         )
-    if len(adapted_targets) != EXPECTED_ADAPTER_TARGET_COUNT:
+    expected_target_count = EXPECTED_DECODER_LAYERS * len(PROJECTION_NAMES)
+    if len(adapted_targets) != expected_target_count:
         raise RuntimeError(
-            f"Expected {EXPECTED_ADAPTER_TARGET_COUNT} adapted multimodal targets, "
+            f"Expected {expected_target_count} adapted LLM projections, "
             f"found {len(adapted_targets)}"
         )
+    for module_name in ("vision_model", "abstractor"):
+        module = getattr(model, module_name)
+        if any(parameter.requires_grad for parameter in module.parameters()):
+            raise RuntimeError(f"{module_name} must remain frozen")
 
 
 def _model_input_device(model: Any) -> Any:
@@ -439,6 +397,8 @@ def train_one_epoch(
     from tqdm.auto import tqdm
 
     model.train()
+    model.vision_model.eval()
+    model.abstractor.eval()
     optimizer.zero_grad(set_to_none=True)
     loss_sum = 0.0
     token_count = 0
@@ -589,7 +549,7 @@ def save_best_adapter(
 ) -> None:
     """Save a standard PEFT adapter directory, never the full VLM weights."""
     adapter_dir.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(
+    model.language_model.save_pretrained(
         adapter_dir,
         safe_serialization=True,
         save_embedding_layers=False,
@@ -603,9 +563,8 @@ def save_best_adapter(
         "best_score": float(best_score),
         "metrics": {key: float(value) for key, value in metrics.items()},
         "args": serialized_args,
-        "adapter_scope": "llm_and_vision_attention_with_abstractor_readout",
-        "target_module_count": EXPECTED_ADAPTER_TARGET_COUNT,
-        "frozen_base_weights": True,
+        "adapter_scope": "language_model_only",
+        "frozen_modules": ["vision_model", "abstractor"],
     }
     metadata_path = adapter_dir / "training_metadata.json"
     temporary_path = metadata_path.with_suffix(".json.tmp")
@@ -625,7 +584,7 @@ def load_best_adapter(model: Any, adapter_dir: Path) -> dict[str, Any]:
     if not metadata_path.is_file():
         raise FileNotFoundError(f"Best adapter metadata does not exist: {metadata_path}")
     adapter_state = load_peft_weights(str(adapter_dir), device="cpu")
-    set_peft_model_state_dict(model, adapter_state)
+    set_peft_model_state_dict(model.language_model, adapter_state)
     return json.loads(metadata_path.read_text(encoding="utf-8"))
 
 
