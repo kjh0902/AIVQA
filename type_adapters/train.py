@@ -81,7 +81,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-ratio", type=float, default=0.10)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--early-stopping-patience", type=int, default=2)
-    parser.add_argument("--max-length", type=int, default=2048)
+    parser.add_argument("--max-length", type=int, default=4096)
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
