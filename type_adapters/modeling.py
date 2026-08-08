@@ -10,7 +10,6 @@ from typing import Any
 
 from train_lora import (
     IMAGE_COMPRESSION_FACTOR,
-    _enable_llm_gradient_checkpointing,
     _prepare_llm_for_training,
     _verify_multimodal_adapters_are_trainable,
     configure_image_pixel_limits,
@@ -150,6 +149,7 @@ def load_base_model_and_processor(
         model.language_model = _prepare_llm_for_training(
             model,
             load_in_4bit=args.load_in_4bit,
+            gradient_checkpointing=args.gradient_checkpointing,
         )
     else:
         model.eval()
@@ -157,16 +157,15 @@ def load_base_model_and_processor(
 
 
 def attach_shared_adapter_for_training(
-    model: Any,
-    shared_adapter_dir: str | Path,
-    *,
-    gradient_checkpointing: bool,
+    model: Any, shared_adapter_dir: str | Path
 ) -> Any:
     peft_model = load_trainable_shared_adapter(
         model,
         shared_adapter_dir,
     )
-    _enable_llm_gradient_checkpointing(peft_model, gradient_checkpointing)
+    llm = peft_model.language_model
+    if hasattr(llm, "_require_grads_hook"):
+        llm.disable_input_require_grads()
     _verify_multimodal_adapters_are_trainable(peft_model)
     peft_model.print_trainable_parameters()
     return peft_model

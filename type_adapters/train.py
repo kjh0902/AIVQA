@@ -204,11 +204,7 @@ def train_question_form(
     try:
         set_seed(args.seed)
         model, processor, dtype = load_base_model_and_processor(args, for_training=True)
-        model = attach_shared_adapter_for_training(
-            model,
-            args.shared_adapter_dir,
-            gradient_checkpointing=args.gradient_checkpointing,
-        )
+        model = attach_shared_adapter_for_training(model, args.shared_adapter_dir)
 
         train_loader = DataLoader(
             train_dataset,

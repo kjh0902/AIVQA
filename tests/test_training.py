@@ -16,7 +16,6 @@ from train_lora import (
     EXPECTED_VISION_LAYERS,
     IMAGE_COMPRESSION_FACTOR,
     MODEL_ID,
-    _enable_llm_gradient_checkpointing,
     _verify_multimodal_adapters_are_trainable,
     configure_image_pixel_limits,
     create_run_output_dir,
@@ -49,28 +48,6 @@ class TrainingUtilitiesTest(unittest.TestCase):
         self.assertEqual(args.gradient_accumulation_steps, 8)
         self.assertTrue(args.gradient_checkpointing)
         self.assertFalse(args.load_in_4bit)
-
-    def test_gradient_checkpointing_is_enabled_on_llm_after_peft_wrap(self) -> None:
-        class FakeLanguageModel:
-            _require_grads_hook = object()
-
-            def gradient_checkpointing_enable(self, **kwargs):
-                self.checkpointing_kwargs = kwargs
-
-            def disable_input_require_grads(self):
-                self.input_require_grads_disabled = True
-
-        class FakePeftModel:
-            language_model = FakeLanguageModel()
-
-        model = FakePeftModel()
-        _enable_llm_gradient_checkpointing(model, enabled=True)
-
-        self.assertEqual(
-            model.language_model.checkpointing_kwargs,
-            {"gradient_checkpointing_kwargs": {"use_reentrant": False}},
-        )
-        self.assertTrue(model.language_model.input_require_grads_disabled)
 
     def test_each_run_gets_a_unique_timestamped_output_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

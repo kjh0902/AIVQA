@@ -269,8 +269,10 @@ def configure_image_pixel_limits(
     }
 
 
-def _prepare_llm_for_training(model: Any, load_in_4bit: bool) -> Any:
-    """Prepare the language submodule before the full VLM is wrapped by PEFT."""
+def _prepare_llm_for_training(
+    model: Any, load_in_4bit: bool, gradient_checkpointing: bool
+) -> Any:
+    """Prepare the language submodule for quantized training/checkpointing."""
     llm = model.language_model
     if load_in_4bit:
         from peft import prepare_model_for_kbit_training
@@ -284,21 +286,11 @@ def _prepare_llm_for_training(model: Any, load_in_4bit: bool) -> Any:
             llm,
             use_gradient_checkpointing=False,
         )
+    if gradient_checkpointing:
+        llm.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
     return llm
-
-
-def _enable_llm_gradient_checkpointing(model: Any, enabled: bool) -> None:
-    """Enable checkpointing only after PEFT has wrapped the full Kanana VLM."""
-    if not enabled:
-        return
-    llm = model.language_model
-    llm.gradient_checkpointing_enable(
-        gradient_checkpointing_kwargs={"use_reentrant": False}
-    )
-    # Kanana replaces image placeholder embeddings in-place. Non-reentrant
-    # checkpointing computes LoRA gradients without PEFT's input-grad hook.
-    if hasattr(llm, "_require_grads_hook"):
-        llm.disable_input_require_grads()
 
 
 def build_model_and_processor(args: argparse.Namespace) -> tuple[Any, Any, Any]:
@@ -352,6 +344,7 @@ def build_model_and_processor(args: argparse.Namespace) -> tuple[Any, Any, Any]:
     llm = _prepare_llm_for_training(
         model,
         load_in_4bit=args.load_in_4bit,
+        gradient_checkpointing=args.gradient_checkpointing,
     )
     model.language_model = llm
     target_modules = find_adapter_target_modules(
@@ -365,9 +358,12 @@ def build_model_and_processor(args: argparse.Namespace) -> tuple[Any, Any, Any]:
         bias="none",
     )
     model = get_peft_model(model, adapter_config)
-    # Enabling this before get_peft_model makes PEFT call get_input_embeddings()
-    # on KananaVForConditionalGeneration, which the custom wrapper lacks.
-    _enable_llm_gradient_checkpointing(model, args.gradient_checkpointing)
+    # PEFT normally makes embedding outputs require gradients when checkpointing
+    # is enabled. Kanana replaces image placeholder embeddings in-place, which
+    # is incompatible with a leaf embedding tensor. Non-reentrant checkpointing
+    # does not need that hook to compute LoRA parameter gradients.
+    if hasattr(llm, "_require_grads_hook"):
+        llm.disable_input_require_grads()
     _verify_multimodal_adapters_are_trainable(model)
     model.print_trainable_parameters()
     return model, processor, dtype
