@@ -90,6 +90,11 @@ Qdrant collection을 새로 만들거나 수정하지 않는다.
 python -m rag_db.infer_with_rag
 ```
 
+Kanana 입력의 기본 `--max-length`는 4096이다. 모델 processor가 길이 초과 시
+truncation 전에 예외를 내는 동작을 피하기 위해 먼저 제한 없이 한 번 encode한 뒤,
+이미지 토큰과 마지막 생성 프롬프트를 보존하면서 시스템/질문/OCR/RAG 텍스트를
+4096 토큰 이하로 자른다. 다른 제한이 필요하면 `--max-length`로 변경할 수 있다.
+
 기본 입출력은 다음과 같다.
 
 ```text

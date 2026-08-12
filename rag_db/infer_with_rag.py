@@ -21,7 +21,6 @@ from tqdm.auto import tqdm
 from transformers import AutoProcessor, CLIPModel
 
 from aivqa.data import (
-    GenerationCollator,
     KananaVQADataset,
     QUESTION_FORM_INSTRUCTIONS,
     SYSTEM_PROMPT,
@@ -688,6 +687,113 @@ def build_answer_feature(
     }
 
 
+def truncate_kanana_encoding(
+    text_encoding: dict[str, Any],
+    max_length: int,
+    generation_suffix_length: int,
+) -> bool:
+    """Trim an encoded Kanana prompt without removing its image-token block."""
+    input_ids = text_encoding.get("input_ids")
+    attention_mask = text_encoding.get("attention_mask")
+    if not isinstance(input_ids, torch.Tensor) or input_ids.ndim != 1:
+        raise TypeError("Kanana text encoding must contain one-dimensional input_ids")
+    if not isinstance(attention_mask, torch.Tensor) or attention_mask.shape != input_ids.shape:
+        raise TypeError("Kanana text encoding must contain an aligned attention_mask")
+
+    input_length = int(input_ids.numel())
+    if input_length <= max_length:
+        return False
+
+    suffix_length = min(max(generation_suffix_length, 1), input_length, max_length)
+    suffix_start = input_length - suffix_length
+    media_positions = torch.nonzero(input_ids < 0, as_tuple=False).flatten()
+
+    if media_positions.numel() == 0:
+        keep_indices = list(range(max_length - suffix_length)) + list(
+            range(suffix_start, input_length)
+        )
+    else:
+        media_start = int(media_positions[0].item())
+        media_end = int(media_positions[-1].item()) + 1
+        if media_end > suffix_start:
+            raise ValueError("Kanana image tokens overlap the generation prompt")
+
+        media_length = media_end - media_start
+        fixed_length = media_length + suffix_length
+        if fixed_length > max_length:
+            raise ValueError(
+                "Image tokens alone exceed --max-length; reduce --max-pixels or "
+                "increase --max-length"
+            )
+
+        text_budget = max_length - fixed_length
+        before_length = media_start
+        after_length = suffix_start - media_end
+        if before_length + after_length <= text_budget:
+            before_keep = before_length
+            after_keep = after_length
+        else:
+            # Keep the end of the system prefix and the beginning of the user
+            # prompt. The latter preserves question/OCR before trailing RAG text.
+            before_keep = min(before_length, text_budget // 2)
+            after_keep = min(after_length, text_budget - before_keep)
+            remaining = text_budget - before_keep - after_keep
+            extra_before = min(before_length - before_keep, remaining)
+            before_keep += extra_before
+            remaining -= extra_before
+            after_keep += min(after_length - after_keep, remaining)
+
+        keep_indices = (
+            list(range(media_start - before_keep, media_start))
+            + list(range(media_start, media_end))
+            + list(range(media_end, media_end + after_keep))
+            + list(range(suffix_start, input_length))
+        )
+
+    index_tensor = torch.tensor(keep_indices, dtype=torch.long, device=input_ids.device)
+    text_encoding["input_ids"] = input_ids.index_select(0, index_tensor)
+    text_encoding["attention_mask"] = attention_mask.index_select(0, index_tensor)
+    text_encoding["seq_length"] = len(keep_indices)
+    return True
+
+
+def collate_generation_feature(
+    processor: Any,
+    feature: dict[str, Any],
+    max_length: int,
+) -> dict[str, Any]:
+    """Encode once without Kanana's pre-truncation assertion, then trim safely."""
+    image = feature.get("image")
+    conversation = feature.get("conversation")
+    if not isinstance(image, Image.Image):
+        raise ValueError("Generation feature must contain one in-memory PIL image")
+    if not isinstance(conversation, list):
+        raise ValueError("Generation feature must contain a conversation list")
+
+    encoded = processor.encode(
+        {"image": [image], "conv": conversation},
+        max_length=None,
+        add_generation_prompt=True,
+    )
+    suffix_ids = processor.tokenizer("\nAI: ", add_special_tokens=False)["input_ids"]
+    original_length = int(encoded["text"]["input_ids"].numel())
+    was_truncated = truncate_kanana_encoding(
+        encoded["text"], max_length, len(suffix_ids)
+    )
+    if was_truncated:
+        LOGGER.warning(
+            "Truncated Kanana input from %d to %d tokens (--max-length)",
+            original_length,
+            max_length,
+        )
+    return processor.collate(
+        [encoded],
+        padding="longest",
+        padding_side="left",
+        max_length=max_length,
+    )
+
+
 def generate_one(
     model: Any,
     processor: Any,
@@ -697,9 +803,10 @@ def generate_one(
     dtype: Any,
 ) -> str:
     model.eval()
-    collator = GenerationCollator(processor, max_length=max_length)
     device = _model_input_device(model)
-    batch = _move_batch_to_device(collator([feature]), device)
+    batch = _move_batch_to_device(
+        collate_generation_feature(processor, feature, max_length), device
+    )
     with torch.no_grad(), torch.autocast(device_type="cuda", dtype=dtype):
         generated_ids = model.generate(
             **batch,
@@ -853,7 +960,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retrieval-page-size", type=int, default=100)
     parser.add_argument("--rag-device", default="auto", help="auto, cpu, cuda, or cuda:N")
     parser.add_argument("--rag-fp32", action="store_true")
-    parser.add_argument("--max-length", type=int, default=2048)
+    parser.add_argument("--max-length", type=int, default=4096)
     parser.add_argument("--search-max-new-tokens", type=int, default=128)
     parser.add_argument("--answer-max-new-tokens", type=int, default=128)
     parser.add_argument("--seed", type=int, default=42)
