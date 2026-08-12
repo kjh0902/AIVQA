@@ -19,6 +19,12 @@ huggingface_cache/
 checkpoints/
 outputs/
 runs/
+rag_db/huggingface_cache/
+rag_db/qdrant_storage/
+
+# RAG source data is maintained outside Git.
+rag_db/unified_rag.jsonl
+rag_db/images/
 
 # Editors and operating systems
 .idea/
