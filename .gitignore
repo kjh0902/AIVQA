@@ -25,6 +25,7 @@ rag_db/qdrant_storage/
 # RAG source data is maintained outside Git.
 rag_db/unified_rag.jsonl
 rag_db/images/
+rag_db/paddleocr_image_corpus.jsonl
 
 # Editors and operating systems
 .idea/

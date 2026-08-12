@@ -72,3 +72,44 @@ hits = client.query_points(
     limit=10,
 )
 ```
+
+## Kanana + Text/Image RAG test inference
+
+이미 구축된 `aivqa_unified_rag` collection과
+`paddleocr_image_corpus.jsonl`을 사용해 전체 test dataset을 두 단계로 추론한다.
+Qdrant collection을 새로 만들거나 수정하지 않는다.
+
+1. 동일한 Kanana + shared LoRA가 image/question/OCR에서 JSON 검색어를 생성한다.
+2. title exact match 또는 KURE text 검색과 CLIP image 검색을 수행한다.
+3. `doc_id`로 결과를 합치고 `text_score + image_score` 상위 3개 description을 사용한다.
+4. 같은 Kanana + LoRA 인스턴스가 기존 MC/SA/LA 출력 규칙으로 최종 답을 생성한다.
+
+기본 adapter 경로는 요청된 checkpoint의 repository-relative 경로다.
+
+```bash
+python -m rag_db.infer_with_rag
+```
+
+기본 입출력은 다음과 같다.
+
+```text
+adapter: outputs/kanana_1_5_v_3b_lora/run_20260807_183229/best_adapter/
+test:    datasets/한국문화 멀티모달 질의응답/한국문화 멀티모달 질의응답_test.json
+OCR:     rag_db/paddleocr_image_corpus.jsonl
+Qdrant:  rag_db/qdrant_storage/ (collection: aivqa_unified_rag)
+output:  outputs/kanana_1_5_v_3b_rag/한국문화 멀티모달 질의응답_test_predictions.json
+```
+
+Qdrant server를 사용하거나 GPU 메모리를 절약하기 위해 RAG encoder를 CPU에 둘 수도
+있다.
+
+```bash
+python -m rag_db.infer_with_rag \
+  --qdrant-url http://localhost:6333 \
+  --rag-device cpu
+```
+
+API key가 필요한 server는 `QDRANT_API_KEY` 환경 변수를 읽는다. `--qdrant-url`을
+지정하지 않으면 기존 embedded storage를 읽는다. 검색 threshold는 text/image 모두
+기본 `0.9`이며 `--score-threshold`로 조정할 수 있다. threshold를 통과한 결과는
+`--retrieval-page-size` 단위로 모두 조회한 다음 fusion한다.

@@ -27,6 +27,9 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_INPUT = Path("rag_db/unified_rag.jsonl")
 DEFAULT_QDRANT_PATH = Path("rag_db/qdrant_storage")
 DEFAULT_MODEL_CACHE = Path("rag_db/huggingface_cache")
+DEFAULT_COLLECTION = "aivqa_unified_rag"
+DEFAULT_TEXT_MODEL = "nlpai-lab/KURE-v1"
+DEFAULT_IMAGE_MODEL = "openai/clip-vit-base-patch32"
 
 PAYLOAD_FIELDS = (
     "doc_id",
@@ -410,7 +413,7 @@ def parse_args() -> argparse.Namespace:
         description="Build AIVQA's named text + image multivector Qdrant collection.",
     )
     parser.add_argument("--input", default=str(DEFAULT_INPUT), help="JSONL path (repository-relative)")
-    parser.add_argument("--collection", default="aivqa_unified_rag")
+    parser.add_argument("--collection", default=DEFAULT_COLLECTION)
     qdrant_group = parser.add_mutually_exclusive_group()
     qdrant_group.add_argument(
         "--qdrant-path",
@@ -422,8 +425,8 @@ def parse_args() -> argparse.Namespace:
         help="Qdrant server URL; QDRANT_API_KEY is read from the environment when set",
     )
     parser.add_argument("--model-cache", default=str(DEFAULT_MODEL_CACHE))
-    parser.add_argument("--text-model", default="nlpai-lab/KURE-v1")
-    parser.add_argument("--image-model", default="openai/clip-vit-base-patch32")
+    parser.add_argument("--text-model", default=DEFAULT_TEXT_MODEL)
+    parser.add_argument("--image-model", default=DEFAULT_IMAGE_MODEL)
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or cuda:N")
     parser.add_argument("--fp32", action="store_true", help="Disable automatic float16 on CUDA")
     parser.add_argument("--batch-size", type=int, default=64, help="Entities per Qdrant upsert")
