@@ -60,6 +60,8 @@ DEFAULT_ADAPTER_DIR = Path(
     "outputs/kanana_1_5_v_3b_lora/run_20260807_183229/best_adapter"
 )
 DEFAULT_OCR_JSONL = Path("rag_db/paddleocr_image_corpus.jsonl")
+OCR_CONF_THRESHOLD = 0.8
+MAX_OCR_CHARS = 2000
 DEFAULT_OUTPUT = (
     Path("outputs/kanana_1_5_v_3b_rag")
     / f"{DATASET_NAME}_test_predictions.json"
@@ -168,6 +170,36 @@ def parse_search_terms(generated_text: str, maximum: int = 5) -> list[str]:
     return terms
 
 
+def prepare_ocr_text(
+    row: dict[str, Any],
+    confidence_threshold: float = OCR_CONF_THRESHOLD,
+    max_chars: int = MAX_OCR_CHARS,
+) -> str:
+    """Filter OCR lines by confidence and cap the text passed to Kanana."""
+    ocr_lines = row.get("ocr_lines")
+    if isinstance(ocr_lines, list):
+        accepted_lines: list[str] = []
+        for ocr_line in ocr_lines:
+            if not isinstance(ocr_line, dict):
+                continue
+            text = ocr_line.get("text")
+            score = ocr_line.get("score")
+            if not isinstance(text, str) or not text.strip():
+                continue
+            try:
+                confidence = float(score)
+            except (TypeError, ValueError):
+                continue
+            if confidence >= confidence_threshold:
+                accepted_lines.append(text.strip())
+        ocr_text = "\n".join(accepted_lines)
+    else:
+        # Backward compatibility for OCR JSONL files that only contain ocr_text.
+        raw_ocr_text = row.get("ocr_text", "")
+        ocr_text = str(raw_ocr_text).strip() if raw_ocr_text is not None else ""
+    return ocr_text[:max_chars]
+
+
 def load_ocr_index(path: Path) -> dict[tuple[str, str], str]:
     index: dict[tuple[str, str], str] = {}
     with path.open("r", encoding="utf-8") as file:
@@ -187,8 +219,7 @@ def load_ocr_index(path: Path) -> dict[tuple[str, str], str]:
             key = (split.strip(), image_name.strip())
             if key in index:
                 raise ValueError(f"Duplicate OCR mapping for {key!r}")
-            ocr_text = row.get("ocr_text", "")
-            index[key] = str(ocr_text).strip() if ocr_text is not None else ""
+            index[key] = prepare_ocr_text(row)
     return index
 
 

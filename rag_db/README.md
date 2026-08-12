@@ -100,6 +100,11 @@ Qdrant:  rag_db/qdrant_storage/ (collection: aivqa_unified_rag)
 output:  outputs/kanana_1_5_v_3b_rag/한국문화 멀티모달 질의응답_test_predictions.json
 ```
 
+OCR 입력은 `ocr_lines`에서 confidence가 `0.8` 이상인 line만 원래 순서대로
+사용하며, Kanana에 전달되는 OCR 문자열은 최대 2,000자로 제한한다. 기준값은
+`infer_with_rag.py`의 `OCR_CONF_THRESHOLD`와 `MAX_OCR_CHARS`에 정의되어 있다.
+구형 OCR JSONL처럼 `ocr_lines`가 없을 때만 `ocr_text`를 대신 사용한다.
+
 Qdrant server를 사용하거나 GPU 메모리를 절약하기 위해 RAG encoder를 CPU에 둘 수도
 있다.
 

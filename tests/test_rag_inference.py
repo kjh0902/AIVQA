@@ -25,6 +25,7 @@ if DEPENDENCIES_AVAILABLE:
         map_test_ocr,
         normalize_exact_text,
         parse_search_terms,
+        prepare_ocr_text,
     )
 
 
@@ -125,6 +126,22 @@ class RagInferenceTest(unittest.TestCase):
                 }
             ]
             self.assertEqual(map_test_ocr(records, load_ocr_index(path)), ["테스트"])
+
+    def test_ocr_text_filters_confidence_and_caps_length(self) -> None:
+        row = {
+            "ocr_text": "필터링 전 원문",
+            "ocr_lines": [
+                {"text": "제외", "score": 0.799999},
+                {"text": " 경계값 ", "score": 0.8},
+                {"text": "고신뢰", "score": 0.99},
+                {"text": "점수없음"},
+            ],
+        }
+        self.assertEqual(prepare_ocr_text(row), "경계값\n고신뢰")
+        self.assertEqual(prepare_ocr_text(row, max_chars=5), "경계값\n고")
+
+    def test_ocr_text_falls_back_for_legacy_rows(self) -> None:
+        self.assertEqual(prepare_ocr_text({"ocr_text": "  구형 OCR  "}), "구형 OCR")
 
     def test_retrieval_exact_semantic_image_and_doc_id_fusion(self) -> None:
         client = _FakeQdrant()
