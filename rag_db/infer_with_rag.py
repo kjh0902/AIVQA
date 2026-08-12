@@ -6,6 +6,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -86,6 +87,7 @@ SEARCH_QUERY_PROMPT = """질문과 OCR 결과에서 외부 지식 검색에 유�
 - 최대 5개까지만 선택한다.
 - 검색할 만한 단어가 없다면 빈 리스트를 반환한다.
 - 설명 없이 JSON list만 출력한다.
+- 올바른 출력 예시: ["경복궁", "근정전"]
 
 질문:
 {question}
@@ -124,8 +126,55 @@ def normalize_exact_text(value: Any) -> str:
     return " ".join(normalized.split())
 
 
+def _flatten_search_term_value(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        terms: list[str] = []
+        for item in value:
+            terms.extend(_flatten_search_term_value(item))
+        return terms
+    if isinstance(value, dict):
+        preferred_keys = {"search_terms", "searchterms", "terms", "keywords", "검색어"}
+        preferred_values = [
+            item
+            for key, item in value.items()
+            if normalize_exact_text(key).casefold().replace(" ", "_") in preferred_keys
+        ]
+        values = preferred_values or list(value.values())
+        terms = []
+        for item in values:
+            terms.extend(_flatten_search_term_value(item))
+        return terms
+    return []
+
+
+def _parse_loose_search_terms(text: str) -> list[str]:
+    start = text.find("[")
+    end = text.rfind("]")
+    if 0 <= start < end:
+        text = text[start + 1 : end]
+    else:
+        start = text.find("{")
+        end = text.rfind("}")
+        if 0 <= start < end:
+            text = text[start + 1 : end]
+
+    terms: list[str] = []
+    for fragment in re.split(r"[,;|\n]+", text):
+        fragment = re.sub(r"^\s*(?:[-*•]+|\d+[.)])\s*", "", fragment).strip()
+        if ":" in fragment or "：" in fragment:
+            fragment = re.split(r"[:：]", fragment, maxsplit=1)[1]
+        fragment = fragment.strip().strip("\"'`[]{} ")
+        if fragment:
+            terms.append(fragment)
+    return terms
+
+
 def parse_search_terms(generated_text: str, maximum: int = 5) -> list[str]:
-    """Extract a unique string list from a strict or fenced Kanana JSON response."""
+    """Recover search terms from JSON and common non-JSON Kanana responses."""
+    if maximum < 1:
+        return []
     text = generated_text.strip()
     if text.startswith("```"):
         lines = text.splitlines()
@@ -135,29 +184,28 @@ def parse_search_terms(generated_text: str, maximum: int = 5) -> list[str]:
             lines = lines[:-1]
         text = "\n".join(lines).strip()
 
-    try:
-        value = json.loads(text)
-    except json.JSONDecodeError:
-        start = text.find("[")
-        end = text.rfind("]")
-        if start < 0 or end < start:
-            LOGGER.warning("Kanana did not return a JSON search-term list: %r", generated_text)
-            return []
-        try:
-            value = json.loads(text[start : end + 1])
-        except json.JSONDecodeError:
-            LOGGER.warning("Kanana returned malformed search-term JSON: %r", generated_text)
-            return []
+    candidates = [text]
+    for opening, closing in (("[", "]"), ("{", "}")):
+        start = text.find(opening)
+        end = text.rfind(closing)
+        if 0 <= start < end:
+            candidates.append(text[start : end + 1])
 
-    if not isinstance(value, list):
-        LOGGER.warning("Kanana search-term output is not a list: %r", value)
-        return []
+    raw_terms: list[str] | None = None
+    for candidate in candidates:
+        try:
+            value = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        raw_terms = _flatten_search_term_value(value)
+        break
+
+    if raw_terms is None:
+        raw_terms = _parse_loose_search_terms(text)
 
     terms: list[str] = []
     seen: set[str] = set()
-    for item in value:
-        if not isinstance(item, str):
-            continue
+    for item in raw_terms:
         term = item.strip()
         key = normalize_exact_text(term)
         if not key or key in seen:
@@ -166,6 +214,8 @@ def parse_search_terms(generated_text: str, maximum: int = 5) -> list[str]:
         seen.add(key)
         if len(terms) == maximum:
             break
+    if not terms and text not in {"", "[]", "{}"}:
+        LOGGER.warning("Could not recover Kanana search terms from: %r", generated_text)
     return terms
 
 

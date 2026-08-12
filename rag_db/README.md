@@ -84,6 +84,11 @@ Qdrant collection을 새로 만들거나 수정하지 않는다.
 3. `doc_id`로 결과를 합치고 `text_score + image_score` 상위 3개 description을 사용한다.
 4. 같은 Kanana + LoRA 인스턴스가 기존 MC/SA/LA 출력 규칙으로 최종 답을 생성한다.
 
+첫 단계 모델이 JSON list 대신 단일 검색어(`피부과`), 따옴표 없는 목록
+(`[의복명, 전통문화]`) 또는 분류 객체(`{"장소명": "불국사"}`)를 반환해도 검색어를
+복구한다. 객체에서는 분류 key가 아니라 value를 사용하므로 복구 가능한 출력이 빈
+`search_terms`로 버려지지 않는다.
+
 기본 adapter 경로는 요청된 checkpoint의 repository-relative 경로다.
 
 ```bash

@@ -103,7 +103,21 @@ class RagInferenceTest(unittest.TestCase):
     def test_search_term_parser_accepts_fence_and_deduplicates(self) -> None:
         result = parse_search_terms('```json\n[" 경복궁 ", "근정전", "경복궁", 3]\n```')
         self.assertEqual(result, ["경복궁", "근정전"])
-        self.assertEqual(parse_search_terms("not json"), [])
+        self.assertEqual(parse_search_terms("[]"), [])
+
+    def test_search_term_parser_recovers_common_kanana_outputs(self) -> None:
+        self.assertEqual(parse_search_terms("피부과"), ["피부과"])
+        self.assertEqual(
+            parse_search_terms("[의복명, 전통문화]"), ["의복명", "전통문화"]
+        )
+        self.assertEqual(
+            parse_search_terms('{"건축물명": "종묘 정전", "원래 건축물": "정전"}'),
+            ["종묘 정전", "정전"],
+        )
+        self.assertEqual(
+            parse_search_terms('{search_terms: "불국사", 보조어: 석가탑}'),
+            ["불국사", "석가탑"],
+        )
 
     def test_exact_normalization_is_unicode_and_whitespace_only(self) -> None:
         self.assertEqual(normalize_exact_text("  경복궁\n 본전  "), "경복궁 본전")
