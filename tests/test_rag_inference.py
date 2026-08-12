@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 from PIL import Image
 
 RUNTIME_DEPENDENCIES = ("torch", "qdrant_client", "sentence_transformers", "transformers")
@@ -17,6 +18,7 @@ DEPENDENCIES_AVAILABLE = all(
 if DEPENDENCIES_AVAILABLE:
     from rag_db.infer_with_rag import (
         Candidate,
+        LocalImageIndex,
         QdrantRetriever,
         build_answer_feature,
         load_ocr_index,
@@ -137,11 +139,31 @@ class RagInferenceTest(unittest.TestCase):
         self.assertEqual(client.query_calls[0]["score_threshold"], 0.9)
         self.assertEqual(client.query_calls[1]["using"], "image")
         self.assertEqual(client.query_calls[1]["query"], [[1.0]])
+        image_filter = client.query_calls[1]["query_filter"]
+        self.assertEqual(image_filter.must[0].has_vector, "image")
 
         self.assertEqual([item.doc_id for item in candidates], ["exact", "both", "image"])
         both = candidates[1]
         self.assertAlmostEqual(both.final_score, 1.92)
         self.assertEqual(candidates[0].text_score, 2.0)
+
+    def test_local_image_index_uses_max_sim_and_threshold(self) -> None:
+        first = _payload("first", "첫째")
+        second = _payload("second", "둘째")
+        index = LocalImageIndex(
+            payloads=[first, second],
+            vectors=np.asarray(
+                [
+                    [1.0, 0.0],
+                    [0.0, 1.0],
+                    [0.8, 0.6],
+                ],
+                dtype=np.float32,
+            ),
+            owners=np.asarray([0, 0, 1], dtype=np.int32),
+        )
+        results = index.search([1.0, 0.0], 0.9)
+        self.assertEqual(results, [(first, 1.0)])
 
     def test_answer_prompt_omits_empty_rag_section(self) -> None:
         sample = {"question_form": "SA", "image": Image.new("RGB", (4, 4))}

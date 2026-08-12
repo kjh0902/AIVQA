@@ -15,7 +15,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from qdrant_client import QdrantClient
+from qdrant_client import QdrantClient, models
 from sentence_transformers import SentenceTransformer
 from tqdm.auto import tqdm
 from transformers import AutoProcessor, CLIPModel
@@ -395,6 +395,94 @@ class RagEncoders:
         return features[0].float().cpu().tolist()
 
 
+@dataclass
+class LocalImageIndex:
+    """Compact fallback for Qdrant local mode's missing-multivector bug."""
+
+    payloads: list[dict[str, Any]]
+    vectors: np.ndarray
+    owners: np.ndarray
+
+    @classmethod
+    def load(
+        cls,
+        client: QdrantClient,
+        collection_name: str,
+        page_size: int = 256,
+    ) -> LocalImageIndex:
+        payloads: list[dict[str, Any]] = []
+        matrices: list[np.ndarray] = []
+        owners: list[np.ndarray] = []
+        offset: Any = None
+        while True:
+            points, offset = client.scroll(
+                collection_name=collection_name,
+                scroll_filter=models.Filter(
+                    must=[models.HasVectorCondition(has_vector=IMAGE_VECTOR_NAME)]
+                ),
+                limit=page_size,
+                offset=offset,
+                with_payload=True,
+                with_vectors=[IMAGE_VECTOR_NAME],
+            )
+            for point in points:
+                payload = validate_payload(point.payload)
+                named_vectors = point.vector
+                if not isinstance(named_vectors, dict):
+                    raise ValueError("Qdrant image point does not use named vectors")
+                matrix = np.asarray(named_vectors.get(IMAGE_VECTOR_NAME), dtype=np.float32)
+                if matrix.ndim != 2 or matrix.shape[0] == 0:
+                    raise ValueError(
+                        f"Qdrant point {payload['doc_id']} has an invalid image multivector"
+                    )
+                norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+                if np.any(norms == 0):
+                    raise ValueError(
+                        f"Qdrant point {payload['doc_id']} has a zero image vector"
+                    )
+                matrix = matrix / norms
+                owner = len(payloads)
+                payloads.append(payload)
+                matrices.append(matrix)
+                owners.append(np.full(matrix.shape[0], owner, dtype=np.int32))
+            if offset is None:
+                break
+
+        if not matrices:
+            raise ValueError("Qdrant collection contains no image vectors")
+        vectors = np.concatenate(matrices, axis=0)
+        owner_ids = np.concatenate(owners)
+        LOGGER.info(
+            "Loaded local image search matrix: entities=%d, images=%d, dimension=%d",
+            len(payloads),
+            vectors.shape[0],
+            vectors.shape[1],
+        )
+        return cls(payloads=payloads, vectors=vectors, owners=owner_ids)
+
+    def search(
+        self, query_vector: Sequence[float], score_threshold: float
+    ) -> list[tuple[dict[str, Any], float]]:
+        query = np.asarray(query_vector, dtype=np.float32)
+        if query.ndim != 1 or query.shape[0] != self.vectors.shape[1]:
+            raise ValueError(
+                f"Image query shape {query.shape} does not match {self.vectors.shape[1]}"
+            )
+        norm = float(np.linalg.norm(query))
+        if norm == 0.0:
+            raise ValueError("Image query embedding is a zero vector")
+        similarities = self.vectors @ (query / norm)
+        entity_scores = np.full(len(self.payloads), -np.inf, dtype=np.float32)
+        # With one query vector, Qdrant MAX_SIM is the maximum cosine score
+        # among all image vectors stored for the entity.
+        np.maximum.at(entity_scores, self.owners, similarities)
+        accepted = np.flatnonzero(entity_scores >= score_threshold)
+        return [
+            (self.payloads[index], float(entity_scores[index]))
+            for index in accepted
+        ]
+
+
 class QdrantRetriever:
     def __init__(
         self,
@@ -403,6 +491,7 @@ class QdrantRetriever:
         encoders: RagEncoders,
         threshold: float,
         retrieval_page_size: int,
+        local_image_search: bool = False,
     ) -> None:
         self.client = client
         self.collection_name = collection_name
@@ -410,6 +499,11 @@ class QdrantRetriever:
         self.threshold = threshold
         self.retrieval_page_size = retrieval_page_size
         self.title_index = load_title_index(client, collection_name)
+        self.local_image_index = (
+            LocalImageIndex.load(client, collection_name)
+            if local_image_search
+            else None
+        )
 
     def _retrieve_payloads(self, doc_ids: Sequence[str]) -> list[dict[str, Any]]:
         if not doc_ids:
@@ -427,7 +521,13 @@ class QdrantRetriever:
             raise ValueError(f"Exact-title Qdrant points could not be retrieved: {missing}")
         return payloads
 
-    def _query_all(self, query: list[Any], vector_name: str) -> list[Any]:
+    def _query_all(
+        self,
+        query: list[Any],
+        vector_name: str,
+        *,
+        require_vector: bool = False,
+    ) -> list[Any]:
         """Page through every result accepted by the modality threshold."""
         points: list[Any] = []
         offset = 0
@@ -436,6 +536,13 @@ class QdrantRetriever:
                 collection_name=self.collection_name,
                 query=query,
                 using=vector_name,
+                query_filter=(
+                    models.Filter(
+                        must=[models.HasVectorCondition(has_vector=vector_name)]
+                    )
+                    if require_vector
+                    else None
+                ),
                 score_threshold=self.threshold,
                 limit=self.retrieval_page_size,
                 offset=offset,
@@ -482,14 +589,21 @@ class QdrantRetriever:
                     text_score=float(point.score),
                 )
 
-        for point in self._query_all(
-            [self.encoders.embed_image(image)], IMAGE_VECTOR_NAME
-        ):
-            self._merge(
-                candidates,
-                validate_payload(point.payload),
-                image_score=float(point.score),
-            )
+        image_vector = self.encoders.embed_image(image)
+        if self.local_image_index is not None:
+            for payload, score in self.local_image_index.search(
+                image_vector, self.threshold
+            ):
+                self._merge(candidates, payload, image_score=score)
+        else:
+            for point in self._query_all(
+                [image_vector], IMAGE_VECTOR_NAME, require_vector=True
+            ):
+                self._merge(
+                    candidates,
+                    validate_payload(point.payload),
+                    image_score=float(point.score),
+                )
 
         return sorted(
             candidates.values(),
@@ -630,6 +744,7 @@ def run_inference(args: argparse.Namespace) -> list[str]:
             encoders,
             args.score_threshold,
             args.retrieval_page_size,
+            local_image_search=qdrant_path is not None,
         )
         predictions: list[str] = []
         for index in tqdm(range(len(dataset)), desc="two-pass RAG inference", unit="sample"):

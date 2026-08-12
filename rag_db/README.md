@@ -113,3 +113,8 @@ API key가 필요한 server는 `QDRANT_API_KEY` 환경 변수를 읽는다. `--q
 지정하지 않으면 기존 embedded storage를 읽는다. 검색 threshold는 text/image 모두
 기본 `0.9`이며 `--score-threshold`로 조정할 수 있다. threshold를 통과한 결과는
 `--retrieval-page-size` 단위로 모두 조회한 다음 fusion한다.
+
+이미지가 없는 entity는 DB에 그대로 존재한다. Qdrant server 연결에서는 `has_vector`
+filter와 native multivector 검색을 사용한다. Embedded local mode의 multivector 구현은
+누락된 vector를 거리 계산 전에 제외하지 못하므로, 시작할 때 image vector를 Qdrant에서
+한 번 읽어 compact NumPy 행렬을 만들고 동일한 cosine + entity별 MAX_SIM을 계산한다.
