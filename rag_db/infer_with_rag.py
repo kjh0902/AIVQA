@@ -21,12 +21,7 @@ from sentence_transformers import SentenceTransformer
 from tqdm.auto import tqdm
 from transformers import AutoProcessor, CLIPModel
 
-from aivqa.data import (
-    KananaVQADataset,
-    QUESTION_FORM_INSTRUCTIONS,
-    SYSTEM_PROMPT,
-    format_question,
-)
+from aivqa.data import KananaVQADataset
 from train_lora import (
     DATASET_DIR,
     DATASET_NAME,
@@ -53,15 +48,13 @@ from .build_qdrant import (
     REPOSITORY_ROOT,
     deterministic_point_id,
 )
+from .prompts import Candidate, build_answer_feature, build_search_feature
 
 
 LOGGER = logging.getLogger("aivqa.rag_inference")
 DEFAULT_ADAPTER_DIR = Path(
     "outputs/kanana_1_5_v_3b_lora/run_20260807_183229/best_adapter"
 )
-DEFAULT_OCR_JSONL = Path("rag_db/paddleocr_image_corpus.jsonl")
-OCR_CONF_THRESHOLD = 0.8
-MAX_OCR_CHARS = 2000
 DEFAULT_OUTPUT = (
     Path("outputs/kanana_1_5_v_3b_rag")
     / f"{DATASET_NAME}_test_predictions.json"
@@ -76,42 +69,6 @@ REQUIRED_PAYLOAD_FIELDS = {
     "description",
     "image_path",
 }
-
-SEARCH_QUERY_SYSTEM_PROMPT = (
-    "당신은 한국 문화 지식 검색어 추출기입니다. 정답을 답하지 말고 요청된 JSON list만 출력하세요."
-)
-SEARCH_QUERY_PROMPT = """질문과 OCR 결과에서 외부 지식 검색에 유용한 핵심 검색어를 추출하라.
-
-- 인물명, 장소명, 기관명, 문화재명, 사건명, 음식명, 의복명, 전통문화 개념 등 검색 가치가 높은 명사구를 우선한다.
-- "사진", "물건", "장소", "한국", "설명" 같은 일반어는 제외한다.
-- 최대 5개까지만 선택한다.
-- 검색할 만한 단어가 없다면 빈 리스트를 반환한다.
-- 설명 없이 JSON list만 출력한다.
-- 올바른 출력 예시: ["경복궁", "근정전"]
-
-질문:
-{question}
-
-OCR 결과:
-{ocr_text}"""
-
-REFERENCE_CAUTION = (
-    "검색된 참고정보는 외부 검색 결과이며 정답이 아닐 수 있습니다. "
-    "사진 및 질문과 일치하지 않는 정보는 무시하고 답하십시오."
-)
-
-
-@dataclass
-class Candidate:
-    doc_id: str
-    payload: dict[str, Any]
-    text_score: float = 0.0
-    image_score: float = 0.0
-
-    @property
-    def final_score(self) -> float:
-        return self.text_score + self.image_score
-
 
 def resolve_repository_path(path: str | Path) -> Path:
     candidate = Path(path).expanduser()
@@ -217,87 +174,6 @@ def parse_search_terms(generated_text: str, maximum: int = 5) -> list[str]:
     if not terms and text not in {"", "[]", "{}"}:
         LOGGER.warning("Could not recover Kanana search terms from: %r", generated_text)
     return terms
-
-
-def prepare_ocr_text(
-    row: dict[str, Any],
-    confidence_threshold: float = OCR_CONF_THRESHOLD,
-    max_chars: int = MAX_OCR_CHARS,
-) -> str:
-    """Filter OCR lines by confidence and cap the text passed to Kanana."""
-    ocr_lines = row.get("ocr_lines")
-    if isinstance(ocr_lines, list):
-        accepted_lines: list[str] = []
-        for ocr_line in ocr_lines:
-            if not isinstance(ocr_line, dict):
-                continue
-            text = ocr_line.get("text")
-            score = ocr_line.get("score")
-            if not isinstance(text, str) or not text.strip():
-                continue
-            try:
-                confidence = float(score)
-            except (TypeError, ValueError):
-                continue
-            if confidence >= confidence_threshold:
-                accepted_lines.append(text.strip())
-        ocr_text = "\n".join(accepted_lines)
-    else:
-        # Backward compatibility for OCR JSONL files that only contain ocr_text.
-        raw_ocr_text = row.get("ocr_text", "")
-        ocr_text = str(raw_ocr_text).strip() if raw_ocr_text is not None else ""
-    return ocr_text[:max_chars]
-
-
-def load_ocr_index(path: Path) -> dict[tuple[str, str], str]:
-    index: dict[tuple[str, str], str] = {}
-    with path.open("r", encoding="utf-8") as file:
-        for line_number, line in enumerate(file, start=1):
-            if not line.strip():
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise ValueError(f"Invalid OCR JSON on line {line_number}: {exc}") from exc
-            split = row.get("split")
-            image_name = row.get("image_name")
-            if not isinstance(split, str) or not isinstance(image_name, str):
-                raise ValueError(
-                    f"OCR line {line_number} must contain string split and image_name"
-                )
-            key = (split.strip(), image_name.strip())
-            if key in index:
-                raise ValueError(f"Duplicate OCR mapping for {key!r}")
-            index[key] = prepare_ocr_text(row)
-    return index
-
-
-def record_image_name(record: dict[str, Any], index: int) -> str:
-    model_input = record.get("model_input")
-    if not isinstance(model_input, dict):
-        raise ValueError(f"Sample {index}: model_input must be an object")
-    for key in ("image_path", "image_name", "image"):
-        value = model_input.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    raise ValueError(f"Sample {index}: no image path field was found")
-
-
-def map_test_ocr(
-    records: Sequence[dict[str, Any]], ocr_index: dict[tuple[str, str], str]
-) -> list[str]:
-    mapped: list[str] = []
-    for index, record in enumerate(records):
-        metadata = record.get("metadata")
-        if not isinstance(metadata, dict):
-            raise ValueError(f"Sample {index}: metadata must be an object")
-        split = str(metadata.get("split", "")).strip()
-        image_name = record_image_name(record, index)
-        key = (split, image_name)
-        if key not in ocr_index:
-            raise KeyError(f"Sample {index}: OCR mapping does not exist for {key!r}")
-        mapped.append(ocr_index[key])
-    return mapped
 
 
 def validate_payload(payload: Any) -> dict[str, Any]:
@@ -691,52 +567,6 @@ class QdrantRetriever:
         )[:3]
 
 
-def build_search_feature(sample: dict[str, Any], question: str, ocr_text: str) -> dict[str, Any]:
-    prompt = SEARCH_QUERY_PROMPT.format(
-        question=question.strip(),
-        ocr_text=ocr_text.strip() or "(인식된 텍스트 없음)",
-    )
-    return {
-        "conversation": [
-            {"role": "system", "content": SEARCH_QUERY_SYSTEM_PROMPT},
-            {"role": "user", "content": "<image>"},
-            {"role": "user", "content": prompt},
-        ],
-        "image": sample["image"],
-    }
-
-
-def build_answer_feature(
-    sample: dict[str, Any],
-    question: str,
-    options: Sequence[str],
-    ocr_text: str,
-    candidates: Sequence[Candidate],
-) -> dict[str, Any]:
-    question_form = sample["question_form"]
-    system_prompt = (
-        f"{SYSTEM_PROMPT}\n\n{QUESTION_FORM_INSTRUCTIONS[question_form]}\n\n"
-        f"{REFERENCE_CAUTION}"
-    )
-    parts = [format_question(question_form, question, options)]
-    parts.append(f"OCR 결과:\n{ocr_text.strip() or '(인식된 텍스트 없음)'}")
-    descriptions = [
-        str(candidate.payload.get("description", "")).strip()
-        for candidate in candidates
-        if str(candidate.payload.get("description", "")).strip()
-    ]
-    if descriptions:
-        parts.append("RAG 참고정보:\n" + "\n\n---\n\n".join(descriptions))
-    return {
-        "conversation": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": "<image>"},
-            {"role": "user", "content": "\n\n".join(parts)},
-        ],
-        "image": sample["image"],
-    }
-
-
 def truncate_kanana_encoding(
     text_encoding: dict[str, Any],
     max_length: int,
@@ -784,7 +614,7 @@ def truncate_kanana_encoding(
             after_keep = after_length
         else:
             # Keep the end of the system prefix and the beginning of the user
-            # prompt. The latter preserves question/OCR before trailing RAG text.
+            # prompt. The latter preserves the question before trailing RAG text.
             before_keep = min(before_length, text_budget // 2)
             after_keep = min(after_length, text_budget - before_keep)
             remaining = text_budget - before_keep - after_keep
@@ -874,19 +704,24 @@ def generate_one(
     )[0].strip()
 
 
-def load_kanana_with_adapter(args: argparse.Namespace) -> tuple[Any, Any, Any]:
+def load_kanana_with_adapter(
+    args: argparse.Namespace, adapter_dir: str | Path | None = None
+) -> tuple[Any, Any, Any]:
     from peft import PeftModel
 
-    adapter_dir = validate_adapter_checkpoint(resolve_repository_path(args.adapter_dir))
+    requested_adapter = args.adapter_dir if adapter_dir is None else adapter_dir
+    resolved_adapter = validate_adapter_checkpoint(
+        resolve_repository_path(requested_adapter)
+    )
     model, processor, dtype = load_base_model_and_processor(args, for_training=False)
     model.language_model = PeftModel.from_pretrained(
         model.language_model,
-        str(adapter_dir),
+        str(resolved_adapter),
         is_trainable=False,
     )
     model.requires_grad_(False)
     model.eval()
-    LOGGER.info("Attached shared LoRA adapter: %s", adapter_dir)
+    LOGGER.info("Attached frozen LoRA adapter: %s", resolved_adapter)
     return model, processor, dtype
 
 
@@ -900,7 +735,6 @@ def read_test_records(path: Path) -> list[dict[str, Any]]:
 def run_inference(args: argparse.Namespace) -> list[str]:
     test_json = resolve_repository_path(args.test_json)
     dataset_root = resolve_repository_path(args.dataset_root)
-    ocr_jsonl = resolve_repository_path(args.ocr_jsonl)
     model_cache = resolve_repository_path(args.model_cache)
     qdrant_path = None if args.qdrant_url else resolve_repository_path(args.qdrant_path)
 
@@ -908,8 +742,6 @@ def run_inference(args: argparse.Namespace) -> list[str]:
     dataset = KananaVQADataset(test_json, dataset_root=dataset_root)
     if len(records) != len(dataset):
         raise RuntimeError("Test record and dataset lengths differ")
-    ocr_texts = map_test_ocr(records, load_ocr_index(ocr_jsonl))
-
     model, processor, dtype = load_kanana_with_adapter(args)
     encoders = RagEncoders(
         DEFAULT_TEXT_MODEL,
@@ -942,12 +774,10 @@ def run_inference(args: argparse.Namespace) -> list[str]:
             options = model_input.get("options", [])
             if not isinstance(options, list):
                 raise ValueError(f"Sample {index}: model_input.options must be a list")
-            ocr_text = ocr_texts[index]
-
             search_output = generate_one(
                 model,
                 processor,
-                build_search_feature(sample, question, ocr_text),
+                build_search_feature(sample, question),
                 args.max_length,
                 args.search_max_new_tokens,
                 dtype,
@@ -976,7 +806,6 @@ def run_inference(args: argparse.Namespace) -> list[str]:
                         sample,
                         question,
                         options,
-                        ocr_text,
                         candidates,
                     ),
                     args.max_length,
@@ -999,7 +828,6 @@ def parse_args() -> argparse.Namespace:
         "--test-json", type=Path, default=DATASET_DIR / f"{DATASET_NAME}_test.json"
     )
     parser.add_argument("--dataset-root", type=Path, default=Path("datasets"))
-    parser.add_argument("--ocr-jsonl", type=Path, default=DEFAULT_OCR_JSONL)
     parser.add_argument("--output-path", type=Path, default=DEFAULT_OUTPUT)
     qdrant_group = parser.add_mutually_exclusive_group()
     qdrant_group.add_argument("--qdrant-path", type=Path, default=DEFAULT_QDRANT_PATH)
@@ -1040,7 +868,6 @@ def parse_args() -> argparse.Namespace:
 def validate_input_paths(args: argparse.Namespace) -> None:
     for label, path in (
         ("test JSON", args.test_json),
-        ("OCR JSONL", args.ocr_jsonl),
         ("adapter", args.adapter_dir),
     ):
         resolved = resolve_repository_path(path)

@@ -75,11 +75,11 @@ hits = client.query_points(
 
 ## Kanana + Text/Image RAG test inference
 
-이미 구축된 `aivqa_unified_rag` collection과
-`paddleocr_image_corpus.jsonl`을 사용해 전체 test dataset을 두 단계로 추론한다.
+이미 구축된 `aivqa_unified_rag` collection을 사용해 전체 test dataset을 두 단계로
+추론한다.
 Qdrant collection을 새로 만들거나 수정하지 않는다.
 
-1. 동일한 Kanana + shared LoRA가 image/question/OCR에서 JSON 검색어를 생성한다.
+1. 동일한 Kanana + shared LoRA가 image/question에서 JSON 검색어를 생성한다.
 2. title exact match 또는 KURE text 검색과 CLIP image 검색을 수행한다.
 3. `doc_id`로 결과를 합치고 `text_score + image_score` 상위 3개 description을 사용한다.
 4. 같은 Kanana + LoRA 인스턴스가 기존 MC/SA/LA 출력 규칙으로 최종 답을 생성한다.
@@ -97,7 +97,7 @@ python -m rag_db.infer_with_rag
 
 Kanana 입력의 기본 `--max-length`는 4096이다. 모델 processor가 길이 초과 시
 truncation 전에 예외를 내는 동작을 피하기 위해 먼저 제한 없이 한 번 encode한 뒤,
-이미지 토큰과 마지막 생성 프롬프트를 보존하면서 시스템/질문/OCR/RAG 텍스트를
+이미지 토큰과 마지막 생성 프롬프트를 보존하면서 시스템/질문/RAG 텍스트를
 4096 토큰 이하로 자른다. 다른 제한이 필요하면 `--max-length`로 변경할 수 있다.
 
 기본 입출력은 다음과 같다.
@@ -105,15 +105,9 @@ truncation 전에 예외를 내는 동작을 피하기 위해 먼저 제한 없�
 ```text
 adapter: outputs/kanana_1_5_v_3b_lora/run_20260807_183229/best_adapter/
 test:    datasets/한국문화 멀티모달 질의응답/한국문화 멀티모달 질의응답_test.json
-OCR:     rag_db/paddleocr_image_corpus.jsonl
 Qdrant:  rag_db/qdrant_storage/ (collection: aivqa_unified_rag)
 output:  outputs/kanana_1_5_v_3b_rag/한국문화 멀티모달 질의응답_test_predictions.json
 ```
-
-OCR 입력은 `ocr_lines`에서 confidence가 `0.8` 이상인 line만 원래 순서대로
-사용하며, Kanana에 전달되는 OCR 문자열은 최대 2,000자로 제한한다. 기준값은
-`infer_with_rag.py`의 `OCR_CONF_THRESHOLD`와 `MAX_OCR_CHARS`에 정의되어 있다.
-구형 OCR JSONL처럼 `ocr_lines`가 없을 때만 `ocr_text`를 대신 사용한다.
 
 Qdrant server를 사용하거나 GPU 메모리를 절약하기 위해 RAG encoder를 CPU에 둘 수도
 있다.

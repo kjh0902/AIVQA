@@ -141,6 +141,8 @@ class KananaVQADataset:
             "answer": answer,
             "question_id": str(metadata.get("question_id", index)),
             "question_form": question_form,
+            "question": question,
+            "options": [str(option) for option in options],
             "formatted_question": formatted_question,
             "image_path": str(image_path),
         }

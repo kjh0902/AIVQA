@@ -21,6 +21,54 @@ Answer
 사용합니다. LoRA는 32개 LLM decoder layer의 `q_proj`, `k_proj`, `v_proj`,
 `o_proj` 128개에만 적용하며, 실행 시 trainable parameter 범위를 검사합니다.
 
+## 전체 RAG 학습 및 추론 파이프라인
+
+다음 명령 하나로 RAG 로드부터 `answer.json` 생성까지 순서대로 실행합니다.
+
+```bash
+python run_rag_pipeline.py
+```
+
+실행 순서는 고정되어 있습니다.
+
+1. KURE/CLIP RAG encoder와 기존 Qdrant collection을 로드합니다.
+2. Base Kanana가 train+validation 각 sample의 검색어를 생성하고 text/image RAG
+   결과를 prompt에 추가합니다.
+3. train+validation 전체로 Shared LoRA를 validation 없이 정확히 2 epoch 학습하고
+   마지막 checkpoint를 `shared_adapter/`에 저장합니다.
+4. 완성된 Shared Adapter가 유형별 train/validation의 RAG context를 생성합니다.
+5. 동일한 Shared Adapter에서 MC, SA, LA를 각각 독립적으로 분기해 정확히 3 epoch
+   학습합니다. 매 epoch validation을 수행하고 유형별 지표로 best Adapter를 저장합니다.
+6. Test 문항 유형에 맞는 best Adapter로 검색어 생성과 RAG 답변 생성을 수행합니다.
+7. 원본 test 레코드 순서를 보존한 제출 파일을 `answer.json`으로 저장합니다.
+
+기본 출력 구조는 다음과 같습니다.
+
+```text
+outputs/kanana_1_5_v_3b_rag_pipeline/run_YYYYMMDD_HHMMSS/
+├── shared_adapter/
+├── mc_adapter/
+├── sa_adapter/
+├── la_adapter/
+├── rag_cache/
+├── pipeline_summary.json
+└── answer.json
+```
+
+학습 VRAM을 보존하기 위해 RAG encoder는 기본적으로 CPU에 둡니다. 별도 Qdrant
+server나 RAG GPU를 사용하려면 다음처럼 지정할 수 있습니다.
+
+```bash
+python run_rag_pipeline.py \
+  --qdrant-url http://localhost:6333 \
+  --rag-device cuda
+```
+
+RAG context는 검색 점수 상위 3개 문서에서 만들며 긴 학습 prompt를 제한하기 위해
+기본 2,000자로 자릅니다. `--max-rag-chars`로 바꿀 수 있습니다. 통합 파이프라인의
+기본 이미지 상한은 약 400 visual token이며 `--max-pixels`로 바꿀 수 있습니다. 모든
+단계의 입력은 image, question, options, 검색된 RAG context로만 구성됩니다.
+
 ## 환경 준비
 
 Python 3.11 환경을 권장합니다. RTX 5070 Ti에는 CUDA 12.8 PyTorch wheel을 먼저

@@ -117,6 +117,8 @@ class DatasetTest(unittest.TestCase):
         sample = self.dataset[0]
         self.assertIn("객관식 (MC)", sample["formatted_question"])
         self.assertIn("선택지:\n1) 첫째\n2) 둘째", sample["formatted_question"])
+        self.assertEqual(sample["question"], "정답을 고르세요.")
+        self.assertEqual(sample["options"], ["1) 첫째", "2) 둘째"])
         self.assertEqual(sample["answer"], "2")
         self.assertEqual(
             [message["role"] for message in sample["conversation"]],

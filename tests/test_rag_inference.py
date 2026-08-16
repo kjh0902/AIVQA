@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-import json
 import importlib.util
-import tempfile
 import unittest
-from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 from PIL import Image
+from rag_db.augmentation import CombinedVQADataset, RagAugmentedDataset
+from rag_db.prompts import Candidate, build_answer_feature, build_search_feature
 
 RUNTIME_DEPENDENCIES = ("torch", "qdrant_client", "sentence_transformers", "transformers")
 DEPENDENCIES_AVAILABLE = all(
@@ -17,15 +16,10 @@ DEPENDENCIES_AVAILABLE = all(
 
 if DEPENDENCIES_AVAILABLE:
     from rag_db.infer_with_rag import (
-        Candidate,
         LocalImageIndex,
         QdrantRetriever,
-        build_answer_feature,
-        load_ocr_index,
-        map_test_ocr,
         normalize_exact_text,
         parse_search_terms,
-        prepare_ocr_text,
         truncate_kanana_encoding,
     )
 
@@ -95,6 +89,67 @@ class _FakeQdrant:
         return SimpleNamespace(points=points)
 
 
+class RagPromptAndDatasetTest(unittest.TestCase):
+    def test_search_prompt_uses_only_image_and_question(self) -> None:
+        sample = {"image": Image.new("RGB", (4, 4))}
+        feature = build_search_feature(sample, "경복궁의 건물은 무엇인가?")
+        content = feature["conversation"][-1]["content"]
+        self.assertIn("경복궁의 건물은 무엇인가?", content)
+        self.assertEqual(feature["conversation"][1]["content"], "<image>")
+
+    def test_answer_prompt_omits_empty_rag_section(self) -> None:
+        sample = {"question_form": "SA", "image": Image.new("RGB", (4, 4))}
+        no_rag = build_answer_feature(sample, "질문", [], [])
+        self.assertNotIn("RAG 참고정보", no_rag["conversation"][-1]["content"])
+
+        candidate = Candidate("doc", _payload("doc", "제목", "실제 설명"))
+        with_rag = build_answer_feature(sample, "질문", [], [candidate])
+        content = with_rag["conversation"][-1]["content"]
+        self.assertIn("RAG 참고정보:\n실제 설명", content)
+        self.assertNotIn("제목", content)
+        self.assertIn("정답이 아닐 수 있습니다", with_rag["conversation"][0]["content"])
+
+    def test_answer_prompt_caps_rag_text_for_training(self) -> None:
+        sample = {"question_form": "SA", "image": Image.new("RGB", (4, 4))}
+        candidate = Candidate("doc", _payload("doc", "제목", "가나다라마바사"))
+        feature = build_answer_feature(
+            sample, "질문", [], [candidate], max_rag_chars=4
+        )
+        self.assertIn("RAG 참고정보:\n가나다라", feature["conversation"][-1]["content"])
+
+    def test_rag_dataset_preserves_answer_and_adds_context(self) -> None:
+        class Dataset:
+            records = [
+                {"metadata": {"question_form": "SA"}},
+                {"metadata": {"question_form": "LA"}},
+            ]
+
+            def __len__(self):
+                return 2
+
+            def __getitem__(self, index):
+                return {
+                    "question_id": str(index),
+                    "question_form": self.records[index]["metadata"]["question_form"],
+                    "question": f"질문 {index}",
+                    "options": [],
+                    "answer": f"정답 {index}",
+                    "image": Image.new("RGB", (4, 4)),
+                    "conversation": [],
+                }
+
+        combined = CombinedVQADataset([Dataset(), Dataset()])
+        self.assertEqual(len(combined), 4)
+        self.assertEqual(combined[2]["question_id"], "0")
+
+        candidate = Candidate("doc", _payload("doc", "제목", "검색 본문"))
+        augmented = RagAugmentedDataset(Dataset(), [[candidate], []])
+        first = augmented[0]
+        self.assertEqual(first["answer"], "정답 0")
+        self.assertIn("RAG 참고정보:\n검색 본문", first["conversation"][-1]["content"])
+        self.assertNotIn("RAG 참고정보", augmented[1]["conversation"][-1]["content"])
+
+
 @unittest.skipUnless(
     DEPENDENCIES_AVAILABLE,
     "RAG inference dependencies are not installed",
@@ -122,41 +177,6 @@ class RagInferenceTest(unittest.TestCase):
     def test_exact_normalization_is_unicode_and_whitespace_only(self) -> None:
         self.assertEqual(normalize_exact_text("  경복궁\n 본전  "), "경복궁 본전")
         self.assertNotEqual(normalize_exact_text("경복궁"), normalize_exact_text("경복궁터"))
-
-    def test_ocr_mapping_uses_split_and_image_name(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            path = Path(temp_dir) / "ocr.jsonl"
-            rows = [
-                {"split": "train", "image_name": "same.jpg", "ocr_text": "훈련"},
-                {"split": "test", "image_name": "same.jpg", "ocr_text": "테스트"},
-            ]
-            path.write_text(
-                "\n".join(json.dumps(row, ensure_ascii=False) for row in rows),
-                encoding="utf-8",
-            )
-            records = [
-                {
-                    "metadata": {"split": "test"},
-                    "model_input": {"image_name": "same.jpg"},
-                }
-            ]
-            self.assertEqual(map_test_ocr(records, load_ocr_index(path)), ["테스트"])
-
-    def test_ocr_text_filters_confidence_and_caps_length(self) -> None:
-        row = {
-            "ocr_text": "필터링 전 원문",
-            "ocr_lines": [
-                {"text": "제외", "score": 0.799999},
-                {"text": " 경계값 ", "score": 0.8},
-                {"text": "고신뢰", "score": 0.99},
-                {"text": "점수없음"},
-            ],
-        }
-        self.assertEqual(prepare_ocr_text(row), "경계값\n고신뢰")
-        self.assertEqual(prepare_ocr_text(row, max_chars=5), "경계값\n고")
-
-    def test_ocr_text_falls_back_for_legacy_rows(self) -> None:
-        self.assertEqual(prepare_ocr_text({"ocr_text": "  구형 OCR  "}), "구형 OCR")
 
     def test_kanana_encoding_truncation_preserves_image_and_generation_suffix(self) -> None:
         import torch
@@ -231,17 +251,6 @@ class RagInferenceTest(unittest.TestCase):
         results = index.search([1.0, 0.0], 0.9)
         self.assertEqual(results, [(first, 1.0)])
 
-    def test_answer_prompt_omits_empty_rag_section(self) -> None:
-        sample = {"question_form": "SA", "image": Image.new("RGB", (4, 4))}
-        no_rag = build_answer_feature(sample, "질문", [], "OCR", [])
-        self.assertNotIn("RAG 참고정보", no_rag["conversation"][-1]["content"])
-
-        candidate = Candidate("doc", _payload("doc", "제목", "실제 설명"))
-        with_rag = build_answer_feature(sample, "질문", [], "OCR", [candidate])
-        content = with_rag["conversation"][-1]["content"]
-        self.assertIn("RAG 참고정보:\n실제 설명", content)
-        self.assertNotIn("제목", content)
-        self.assertIn("정답이 아닐 수 있습니다", with_rag["conversation"][0]["content"])
 
 
 if __name__ == "__main__":
