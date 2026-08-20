@@ -38,8 +38,9 @@ python run_rag_pipeline.py
    마지막 checkpoint를 `shared_adapter/`에 저장합니다.
 4. 유형별 train/validation에도 2단계에서 Base Kanana가 만든 RAG context를 그대로
    사용합니다.
-5. 동일한 Shared Adapter에서 MC, SA, LA를 각각 독립적으로 분기해 정확히 3 epoch
-   학습합니다. 매 epoch validation을 수행하고 유형별 지표로 best Adapter를 저장합니다.
+5. 동일한 Shared Adapter에서 MC, SA, LA를 각각 독립적으로 분기해 최대 10 epoch
+   학습합니다. 매 epoch validation을 수행하고 유형별 지표가 2 epoch 연속 개선되지
+   않으면 조기 종료하며, 유형별 best Adapter를 저장합니다.
 6. Test 검색어는 Base Kanana로 생성하고, 문항 유형에 맞는 best Adapter는 RAG 최종
    답변 생성에만 사용합니다.
 7. 원본 test 레코드 순서를 보존한 제출 파일을 `answer.json`으로 저장합니다.
@@ -114,7 +115,8 @@ processor가 요구하는 `{"image": [...], "conv": [...]}` 형식을 만들고
 문제 유형별 instruction은 모든 split에 동일하게 적용됩니다.
 
 - MC: 선택지 번호만 출력, 복수 정답은 오름차순 `/` 구분
-- SA: 요구된 길이와 개수를 지키며 정답만 간결하게 출력
+- SA: 질문에서 `N음절`, `N어절`, `N개`, `N가지`, `N답` 조건을 추출해 샘플별
+  system prompt에 명시하고, 조건을 지킨 정답만 간결하게 출력
 - LA: 250자 이내 한 문단, 같은 내용 반복 금지
 
 학습 label은 assistant 답변 token에만 부여합니다. prompt, padding, 이미지

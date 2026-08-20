@@ -52,12 +52,17 @@ from type_adapters.modeling import (
     load_base_model_and_processor,
     release_cuda_memory,
 )
-from type_adapters.train import train_question_form
+from type_adapters.train import (
+    DEFAULT_EARLY_STOPPING_PATIENCE,
+    DEFAULT_TYPE_EPOCHS,
+    train_question_form,
+)
 
 
 LOGGER = logging.getLogger("aivqa.rag_pipeline")
 SHARED_EPOCHS = 2
-TYPE_EPOCHS = 3
+TYPE_EPOCHS = DEFAULT_TYPE_EPOCHS
+TYPE_EARLY_STOPPING_PATIENCE = DEFAULT_EARLY_STOPPING_PATIENCE
 ANSWER_FILENAME = "answer.json"
 PIPELINE_DEFAULT_MAX_PIXELS = 400 * IMAGE_COMPRESSION_FACTOR**2
 
@@ -484,14 +489,17 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         type_args.epochs = TYPE_EPOCHS
         type_args.learning_rate = args.type_learning_rate
         type_args.weight_decay = args.type_weight_decay
-        type_args.early_stopping_patience = TYPE_EPOCHS
+        type_args.early_stopping_patience = TYPE_EARLY_STOPPING_PATIENCE
         adapter_dirs: dict[str, Path] = {}
         type_results: list[dict[str, Any]] = []
         for step, question_form in enumerate(QUESTION_FORMS, start=3):
             LOGGER.info(
-                "Step %d/7: %s branch, exactly 3 epochs with RAG validation",
+                "Step %d/7: %s branch, up to %d epochs with RAG validation "
+                "(early-stopping patience=%d)",
                 step,
                 question_form,
+                TYPE_EPOCHS,
+                TYPE_EARLY_STOPPING_PATIENCE,
             )
             adapter_dir = run_dir / f"{question_form.lower()}_adapter"
             result = train_question_form(
@@ -529,6 +537,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
                 "shared_validation": False,
                 "shared_history": shared_history,
                 "type_epochs": TYPE_EPOCHS,
+                "type_early_stopping_patience": TYPE_EARLY_STOPPING_PATIENCE,
                 "type_adapters": {
                     key: str(value) for key, value in adapter_dirs.items()
                 },

@@ -99,8 +99,11 @@ class RagPromptAndDatasetTest(unittest.TestCase):
 
     def test_answer_prompt_omits_empty_rag_section(self) -> None:
         sample = {"question_form": "SA", "image": Image.new("RGB", (4, 4))}
-        no_rag = build_answer_feature(sample, "질문", [], [])
+        no_rag = build_answer_feature(sample, "4음절로 답하시오.", [], [])
         self.assertNotIn("RAG 참고정보", no_rag["conversation"][-1]["content"])
+        self.assertIn(
+            "- 요구 음절 수: 4음절", no_rag["conversation"][0]["content"]
+        )
 
         candidate = Candidate("doc", _payload("doc", "제목", "실제 설명"))
         with_rag = build_answer_feature(sample, "질문", [], [candidate])
