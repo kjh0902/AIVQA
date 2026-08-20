@@ -64,8 +64,10 @@ def deterministic_point_id(doc_id: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, doc_id))
 
 
-def make_search_text(search_terms: Sequence[Any]) -> str:
-    """Join search terms into the single string embedded by KURE."""
+def make_search_text(search_terms: str | Sequence[Any]) -> str:
+    """Normalize search terms into the single string embedded by KURE."""
+    if isinstance(search_terms, str):
+        return search_terms.strip()
     return " ".join(str(term).strip() for term in search_terms if str(term).strip())
 
 
@@ -98,8 +100,8 @@ def iter_entities(input_path: Path, stats: BuildStats) -> Iterator[dict[str, Any
                 LOGGER.error("Skipping line %d: doc_id must be a non-empty string", line_number)
                 stats.invalid_entities += 1
                 continue
-            if not isinstance(search_terms, list):
-                LOGGER.error("Skipping %s: search_terms must be a list", doc_id)
+            if not isinstance(search_terms, (str, list)):
+                LOGGER.error("Skipping %s: search_terms must be a string or list", doc_id)
                 stats.invalid_entities += 1
                 continue
             if image_paths is not None and not isinstance(image_paths, list):
