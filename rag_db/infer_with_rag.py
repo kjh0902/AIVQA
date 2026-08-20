@@ -707,13 +707,23 @@ def generate_one(
 def load_kanana_with_adapter(
     args: argparse.Namespace, adapter_dir: str | Path | None = None
 ) -> tuple[Any, Any, Any]:
+    model, processor, dtype = load_base_model_and_processor(args, for_training=False)
+    model = attach_kanana_adapter(model, args, adapter_dir)
+    return model, processor, dtype
+
+
+def attach_kanana_adapter(
+    model: Any,
+    args: argparse.Namespace,
+    adapter_dir: str | Path | None = None,
+) -> Any:
+    """Attach an answer adapter after Base Kanana has generated search queries."""
     from peft import PeftModel
 
     requested_adapter = args.adapter_dir if adapter_dir is None else adapter_dir
     resolved_adapter = validate_adapter_checkpoint(
         resolve_repository_path(requested_adapter)
     )
-    model, processor, dtype = load_base_model_and_processor(args, for_training=False)
     model.language_model = PeftModel.from_pretrained(
         model.language_model,
         str(resolved_adapter),
@@ -722,7 +732,7 @@ def load_kanana_with_adapter(
     model.requires_grad_(False)
     model.eval()
     LOGGER.info("Attached frozen LoRA adapter: %s", resolved_adapter)
-    return model, processor, dtype
+    return model
 
 
 def read_test_records(path: Path) -> list[dict[str, Any]]:
@@ -742,7 +752,7 @@ def run_inference(args: argparse.Namespace) -> list[str]:
     dataset = KananaVQADataset(test_json, dataset_root=dataset_root)
     if len(records) != len(dataset):
         raise RuntimeError("Test record and dataset lengths differ")
-    model, processor, dtype = load_kanana_with_adapter(args)
+    model, processor, dtype = load_base_model_and_processor(args, for_training=False)
     encoders = RagEncoders(
         DEFAULT_TEXT_MODEL,
         DEFAULT_IMAGE_MODEL,
@@ -766,14 +776,13 @@ def run_inference(args: argparse.Namespace) -> list[str]:
             args.retrieval_page_size,
             local_image_search=qdrant_path is not None,
         )
-        predictions: list[str] = []
-        for index in tqdm(range(len(dataset)), desc="two-pass RAG inference", unit="sample"):
+        all_candidates: list[list[Candidate]] = []
+        for index in tqdm(
+            range(len(dataset)), desc="Base Kanana RAG retrieval", unit="sample"
+        ):
             sample = dataset[index]
             model_input = records[index]["model_input"]
             question = str(model_input["question"])
-            options = model_input.get("options", [])
-            if not isinstance(options, list):
-                raise ValueError(f"Sample {index}: model_input.options must be a list")
             search_output = generate_one(
                 model,
                 processor,
@@ -784,6 +793,7 @@ def run_inference(args: argparse.Namespace) -> list[str]:
             )
             search_terms = parse_search_terms(search_output)
             candidates = retriever.retrieve(search_terms, sample["image"])
+            all_candidates.append(candidates)
             LOGGER.info(
                 "sample=%s search_terms=%s candidates=%s",
                 sample["question_id"],
@@ -798,6 +808,18 @@ def run_inference(args: argparse.Namespace) -> list[str]:
                     for item in candidates
                 ],
             )
+
+        model = attach_kanana_adapter(model, args)
+        predictions: list[str] = []
+        for index in tqdm(
+            range(len(dataset)), desc="Adapter RAG answer generation", unit="sample"
+        ):
+            sample = dataset[index]
+            model_input = records[index]["model_input"]
+            question = str(model_input["question"])
+            options = model_input.get("options", [])
+            if not isinstance(options, list):
+                raise ValueError(f"Sample {index}: model_input.options must be a list")
             predictions.append(
                 generate_one(
                     model,
@@ -806,7 +828,7 @@ def run_inference(args: argparse.Namespace) -> list[str]:
                         sample,
                         question,
                         options,
-                        candidates,
+                        all_candidates[index],
                     ),
                     args.max_length,
                     args.answer_max_new_tokens,

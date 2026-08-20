@@ -30,7 +30,6 @@ from rag_db.infer_with_rag import (
     QdrantRetriever,
     RagEncoders,
     create_qdrant_client,
-    load_kanana_with_adapter,
     resolve_repository_path,
     validate_collection_schema,
 )
@@ -367,32 +366,6 @@ def _retrieve_with_base(
         release_cuda_memory()
 
 
-def _retrieve_with_adapter(
-    args: argparse.Namespace,
-    adapter_dir: Path,
-    dataset: Any,
-    retriever: QdrantRetriever,
-    cache_path: Path,
-) -> list[list[Any]]:
-    model = processor = None
-    try:
-        model, processor, dtype = load_kanana_with_adapter(args, adapter_dir)
-        return retrieve_dataset_candidates(
-            model,
-            processor,
-            dataset,
-            retriever,
-            max_length=args.max_length,
-            search_max_new_tokens=args.search_max_new_tokens,
-            dtype=dtype,
-            description="Type train/validation RAG retrieval (Shared Adapter)",
-            cache_path=cache_path,
-        )
-    finally:
-        del processor, model
-        release_cuda_memory()
-
-
 def run_test_inference(
     args: argparse.Namespace,
     test_dataset: KananaVQADataset,
@@ -403,13 +376,10 @@ def run_test_inference(
     model = processor = None
     try:
         model, processor, dtype = load_base_model_and_processor(args, for_training=False)
-        model = attach_type_adapters_for_inference(model, adapter_dirs)
         subsets = build_type_subsets(test_dataset)
-        grouped_predictions: dict[str, list[str]] = {}
+        candidates_by_form: dict[str, list[list[Any]]] = {}
         for question_form in QUESTION_FORMS:
-            model.language_model.set_adapter(question_form)
-            model.eval()
-            candidates = retrieve_dataset_candidates(
+            candidates_by_form[question_form] = retrieve_dataset_candidates(
                 model,
                 processor,
                 subsets[question_form],
@@ -417,12 +387,18 @@ def run_test_inference(
                 max_length=args.max_length,
                 search_max_new_tokens=args.search_max_new_tokens,
                 dtype=dtype,
-                description=f"{question_form} test RAG retrieval (best adapter)",
+                description=f"{question_form} test RAG retrieval (Base Kanana)",
                 cache_path=cache_dir / f"test_{question_form.lower()}.json",
             )
+
+        model = attach_type_adapters_for_inference(model, adapter_dirs)
+        grouped_predictions: dict[str, list[str]] = {}
+        for question_form in QUESTION_FORMS:
+            model.language_model.set_adapter(question_form)
+            model.eval()
             rag_subset = RagAugmentedDataset(
                 subsets[question_form],
-                candidates,
+                candidates_by_form[question_form],
                 max_rag_chars=args.max_rag_chars,
             )
             grouped_predictions[question_form] = generate_rag_predictions(
@@ -485,13 +461,10 @@ def run_pipeline(args: argparse.Namespace) -> Path:
             shared_args, shared_dataset, shared_adapter_dir
         )
 
-        all_type_candidates = _retrieve_with_adapter(
-            args,
-            shared_adapter_dir,
-            train_and_validation,
-            rag.retriever,
-            cache_dir / "type_train_validation.json",
-        )
+        # Search-query generation is always owned by the pretrained Base Kanana.
+        # Reuse its candidates for every downstream adapter branch instead of
+        # allowing the newly trained Shared Adapter to alter retrieval inputs.
+        all_type_candidates = shared_candidates
         train_count = len(train_dataset)
         rag_train = RagAugmentedDataset(
             train_dataset,
@@ -549,6 +522,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
             run_dir / "pipeline_summary.json",
             {
                 "rag_enabled": True,
+                "search_query_model": "base_kanana",
                 "shared_adapter": str(shared_adapter_dir),
                 "shared_epochs": SHARED_EPOCHS,
                 "shared_training_data": "train+validation",

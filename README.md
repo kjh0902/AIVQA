@@ -33,13 +33,15 @@ python run_rag_pipeline.py
 
 1. KURE/CLIP RAG encoder와 기존 Qdrant collection을 로드합니다.
 2. Base Kanana가 train+validation 각 sample의 검색어를 생성하고 text/image RAG
-   결과를 prompt에 추가합니다.
+   결과를 prompt에 추가합니다. 검색어 생성에는 어떤 LoRA도 사용하지 않습니다.
 3. train+validation 전체로 Shared LoRA를 validation 없이 정확히 2 epoch 학습하고
    마지막 checkpoint를 `shared_adapter/`에 저장합니다.
-4. 완성된 Shared Adapter가 유형별 train/validation의 RAG context를 생성합니다.
+4. 유형별 train/validation에도 2단계에서 Base Kanana가 만든 RAG context를 그대로
+   사용합니다.
 5. 동일한 Shared Adapter에서 MC, SA, LA를 각각 독립적으로 분기해 정확히 3 epoch
    학습합니다. 매 epoch validation을 수행하고 유형별 지표로 best Adapter를 저장합니다.
-6. Test 문항 유형에 맞는 best Adapter로 검색어 생성과 RAG 답변 생성을 수행합니다.
+6. Test 검색어는 Base Kanana로 생성하고, 문항 유형에 맞는 best Adapter는 RAG 최종
+   답변 생성에만 사용합니다.
 7. 원본 test 레코드 순서를 보존한 제출 파일을 `answer.json`으로 저장합니다.
 
 기본 출력 구조는 다음과 같습니다.
