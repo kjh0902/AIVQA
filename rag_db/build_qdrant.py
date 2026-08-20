@@ -104,13 +104,14 @@ def iter_entities(input_path: Path, stats: BuildStats) -> Iterator[dict[str, Any
                 LOGGER.error("Skipping %s: search_terms must be a string or list", doc_id)
                 stats.invalid_entities += 1
                 continue
-            if image_paths is not None and not isinstance(image_paths, list):
-                LOGGER.error("Skipping %s: image_path must be a list or null", doc_id)
+            if isinstance(image_paths, str):
+                entity["image_path"] = [image_paths]
+            elif image_paths is None:
+                entity["image_path"] = []
+            elif not isinstance(image_paths, list):
+                LOGGER.error("Skipping %s: image_path must be a string, list, or null", doc_id)
                 stats.invalid_entities += 1
                 continue
-
-            # Keep the payload shape consistent even when image_path is null/missing.
-            entity.setdefault("image_path", [])
             yield entity
 
 
