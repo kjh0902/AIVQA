@@ -392,18 +392,35 @@ def build_sa_retry_feature(
     previous_answer: str,
     validation: ValidationResult,
 ) -> dict[str, Any]:
-    """Append the failed answer and correction request to the original prompt."""
+    """Fold the correction request into the existing single-turn user prompt."""
     conversation = feature.get("conversation")
-    if not isinstance(conversation, list):
-        raise ValueError("SA retry feature requires a conversation list")
+    if not isinstance(conversation, list) or not conversation:
+        raise ValueError("SA retry feature requires a non-empty conversation list")
+
+    retry_conversation = copy.deepcopy(conversation)
+    prompt_index = next(
+        (
+            index
+            for index in range(len(retry_conversation) - 1, -1, -1)
+            if retry_conversation[index].get("role") == "user"
+            and retry_conversation[index].get("content") != "<image>"
+        ),
+        None,
+    )
+    if prompt_index is None:
+        raise ValueError("SA retry feature requires a text user prompt")
+    original_prompt = retry_conversation[prompt_index].get("content")
+    if not isinstance(original_prompt, str) or not original_prompt.strip():
+        raise ValueError("SA retry feature requires a non-empty text user prompt")
+
+    retry_prompt = build_sa_retry_prompt(
+        question, previous_answer, validation
+    )
+    retry_conversation[prompt_index]["content"] = (
+        f"{original_prompt.rstrip()}\n\n[재시도 지시]\n{retry_prompt}"
+    )
     retry_feature = dict(feature)
-    retry_feature["conversation"] = copy.deepcopy(conversation) + [
-        {"role": "assistant", "content": previous_answer.strip()},
-        {
-            "role": "user",
-            "content": build_sa_retry_prompt(question, previous_answer, validation),
-        },
-    ]
+    retry_feature["conversation"] = retry_conversation
     return retry_feature
 
 

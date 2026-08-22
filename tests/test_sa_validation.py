@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 
+from aivqa.data import _conversation
 from aivqa.sa_validation import (
     build_sa_retry_prompt,
     generate_with_sa_retries,
@@ -101,17 +102,51 @@ class SARetryTest(unittest.TestCase):
         self.assertEqual(result, "롯데마트")
         self.assertEqual(len(retry_features), 1)
         retry_conversation = retry_features[0]["conversation"]
-        self.assertEqual(retry_conversation[-2]["content"], "이마트 4음")
-        retry_prompt = retry_conversation[-1]["content"]
+        self.assertEqual(len(retry_conversation), 1)
+        self.assertEqual(retry_conversation[0]["role"], "user")
+        retry_prompt = retry_conversation[0]["content"]
+        self.assertIn("원래 프롬프트", retry_prompt)
+        self.assertIn("이마트 4음", retry_prompt)
         self.assertIn(feature["question"], retry_prompt)
         self.assertIn("처음부터 다시", retry_prompt)
         self.assertIn("글자·숫자·조건 문구를 붙여", retry_prompt)
+        self.assertEqual(_conversation(retry_features[0]), retry_conversation)
+
+    def test_retry_preserves_native_image_prompt_without_assistant_turn(self) -> None:
+        feature = {
+            "question_form": "SA",
+            "question": "4음절로 답하시오.",
+            "conversation": [
+                {"role": "system", "content": "시스템 지시"},
+                {"role": "user", "content": "<image>"},
+                {"role": "user", "content": "원래 질문과 RAG 참고정보"},
+            ],
+        }
+        retry_features = []
+
+        generate_with_sa_retries(
+            feature,
+            "세글자",
+            lambda retry_feature: retry_features.append(retry_feature) or "네글자답",
+        )
+
+        retry_conversation = retry_features[0]["conversation"]
+        self.assertEqual(
+            [message["role"] for message in retry_conversation],
+            ["system", "user", "user"],
+        )
+        self.assertEqual(retry_conversation[1]["content"], "<image>")
+        self.assertIn("원래 질문과 RAG 참고정보", retry_conversation[2]["content"])
+        self.assertFalse(
+            any(message["role"] == "assistant" for message in retry_conversation)
+        )
+        self.assertEqual(_conversation(retry_features[0]), retry_conversation)
 
     def test_retry_runs_at_most_twice_and_returns_last_output_unchanged(self) -> None:
         feature = {
             "question_form": "SA",
             "question": "4음절로 답하시오.",
-            "conversation": [],
+            "conversation": [{"role": "user", "content": "원래 프롬프트"}],
         }
         outputs = iter(("두글자", "세글자"))
         calls = []

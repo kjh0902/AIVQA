@@ -245,7 +245,9 @@ class RagPromptAndDatasetTest(unittest.TestCase):
             {
                 "question_form": "SA",
                 "question": "3음절로 답하시오.",
-                "conversation": [],
+                "conversation": [
+                    {"role": "user", "content": "원래 질문과 RAG 참고정보"}
+                ],
             },
             {
                 "question_form": "MC",
@@ -280,8 +282,16 @@ class RagPromptAndDatasetTest(unittest.TestCase):
         self.assertEqual(len(calls), 4)
         self.assertTrue(all(kwargs == {} for _, kwargs in calls))
         retry_feature = calls[1][0][2]
-        self.assertEqual(retry_feature["conversation"][-2]["content"], "오답")
-        self.assertIn("3음절", retry_feature["conversation"][-1]["content"])
+        retry_prompt = retry_feature["conversation"][-1]["content"]
+        self.assertIn("원래 질문과 RAG 참고정보", retry_prompt)
+        self.assertIn("오답", retry_prompt)
+        self.assertIn("3음절", retry_prompt)
+        self.assertFalse(
+            any(
+                message["role"] == "assistant"
+                for message in retry_feature["conversation"]
+            )
+        )
 
     def test_rag_search_generation_never_receives_length_constraint(self) -> None:
         calls = []
