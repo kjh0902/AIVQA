@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -27,14 +28,117 @@ QUESTION_FORM_INSTRUCTIONS = {
         "'/'로 구분하세요. 설명이나 다른 문장은 출력하지 마세요."
     ),
     "SA": (
-        "질문에서 요구한 음절 수, 어절 수, 답의 개수를 정확히 지키고 정답만 "
-        "간결하게 출력하세요. 설명이나 부가 문장은 출력하지 마세요."
+        "질문에 명시된 출력 조건을 모두 지키고 정답만 출력하세요. "
+        "설명이나 부가 문장은 출력하지 마세요."
     ),
     "LA": (
         "250자 이내의 한 문단으로 답하세요. 같은 내용을 반복하지 말고, 이미지와 "
         "질문에 필요한 내용만 구체적으로 서술하세요."
     ),
 }
+
+_KOREAN_COUNT_WORDS = "한|두|세|네|다섯|여섯|일곱|여덟|아홉|열"
+SA_CONSTRAINT_PATTERN = re.compile(
+    rf"(?<![\d.가-힣])(?P<count>\d+|{_KOREAN_COUNT_WORDS})"
+    r"\s*(?P<unit>음절|어절|가지|개|답)"
+)
+SA_CONSTRAINT_LABELS = {
+    "음절": "음절 수",
+    "어절": "어절 수",
+    "개": "답변 개수",
+    "가지": "답변 개수",
+    "답": "답 수",
+}
+_OUTPUT_DIRECTIVE_PATTERN = re.compile(
+    r"(?:답하|작성하|제시하|나열하|열거하|말하|쓰|적|고르|찾)"
+    r"(?:여|아|어|으)?(?:\s*주)?(?:시오|세요|라)"
+)
+_SENTENCE_BOUNDARIES = ".!?。！？\n"
+
+
+def _sentence_span(text: str, position: int) -> tuple[int, int]:
+    start = max(text.rfind(boundary, 0, position) for boundary in _SENTENCE_BOUNDARIES)
+    ends = [text.find(boundary, position) for boundary in _SENTENCE_BOUNDARIES]
+    valid_ends = [end for end in ends if end >= 0]
+    return start + 1, min(valid_ends, default=len(text))
+
+
+def _is_answer_count_constraint(question: str, match: re.Match[str]) -> bool:
+    """Reject object counts unless they are grammatically tied to an answer command."""
+    sentence_start, sentence_end = _sentence_span(question, match.start())
+    sentence = question[sentence_start:sentence_end]
+    relative_end = match.end() - sentence_start
+    tail = sentence[relative_end:].lstrip()
+
+    if match.group("unit") == "답" and re.match(r"^하(?:시오|세요|라)", tail):
+        return True
+
+    directive = _OUTPUT_DIRECTIVE_PATTERN.search(tail)
+    if directive is None:
+        return False
+
+    before_directive = tail[: directive.start()].strip(" ,()")
+    if not before_directive:
+        return True
+    if before_directive.startswith(("를", "을", "만", "씩", "로")):
+        return True
+    # Handles forms such as "3가지 이유를 답하시오" while excluding factual
+    # descriptions such as "4개의 그릇은 ... 답하시오".
+    return bool(re.fullmatch(r"[가-힣]{1,12}(?:을|를)", before_directive))
+
+
+def extract_sa_constraints(question: str) -> list[tuple[str, str]]:
+    """Extract explicit SA output constraints in their order of appearance."""
+    constraints: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for match in SA_CONSTRAINT_PATTERN.finditer(question):
+        unit = match.group("unit")
+        if unit in {"개", "가지", "답"} and not _is_answer_count_constraint(
+            question, match
+        ):
+            continue
+        count = match.group("count")
+        value = f"{count}{unit}" if count.isdigit() else f"{count} {unit}"
+        constraint = (SA_CONSTRAINT_LABELS[unit], value)
+        if constraint not in seen:
+            constraints.append(constraint)
+            seen.add(constraint)
+    return constraints
+
+
+def build_sa_instruction(question: str) -> str:
+    """Build a per-sample SA instruction containing parsed output constraints."""
+    constraints = extract_sa_constraints(question)
+    lines = [
+        "이 문제는 단답형입니다.",
+        "",
+        "반드시 질문에서 요구하는 출력 조건을 먼저 확인한 뒤 답하세요.",
+    ]
+    if constraints:
+        lines.extend(f"- 요구 {label}: {value}" for label, value in constraints)
+        lines.append("- 최종 답변이 위 조건을 만족하는지 확인한 뒤 출력하세요.")
+    else:
+        lines.append("- 질문에 별도의 출력 조건이 있다면 모두 준수하세요.")
+    lines.extend(
+        [
+            "",
+            "조건을 만족하는 정답만 출력하세요. 설명이나 부가 문장은 출력하지 마세요.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def build_question_form_instruction(question_form: str, question: str) -> str:
+    """Return the form instruction, including per-question SA constraints."""
+    normalized_form = str(question_form).strip().upper()
+    if normalized_form not in QUESTION_FORM_INSTRUCTIONS:
+        allowed = ", ".join(QUESTION_FORM_INSTRUCTIONS)
+        raise ValueError(
+            f"Unsupported question_form {question_form!r}; expected one of: {allowed}"
+        )
+    if normalized_form == "SA":
+        return build_sa_instruction(question)
+    return QUESTION_FORM_INSTRUCTIONS[normalized_form]
 
 
 def format_question(question_form: str, question: str, options: Sequence[str]) -> str:
@@ -100,8 +204,8 @@ class KananaVQADataset:
         model_input = self._require_mapping(record, "model_input", index)
 
         question_form = self._require_text(metadata, "question_form", index).upper()
-        if question_form not in QUESTION_FORM_INSTRUCTIONS:
-            allowed = ", ".join(QUESTION_FORM_INSTRUCTIONS)
+        if question_form not in QUESTION_FORM_LABELS:
+            allowed = ", ".join(QUESTION_FORM_LABELS)
             raise ValueError(
                 f"Sample {index}: unsupported question_form {question_form!r}; "
                 f"expected one of: {allowed}"
@@ -119,9 +223,8 @@ class KananaVQADataset:
         image = self._load_rgb_image(image_path, index)
 
         formatted_question = format_question(question_form, question, options)
-        instruction_prompt = (
-            f"{self.system_prompt}\n\n{QUESTION_FORM_INSTRUCTIONS[question_form]}"
-        )
+        form_instruction = build_question_form_instruction(question_form, question)
+        instruction_prompt = f"{self.system_prompt}\n\n{form_instruction}"
         # This follows the model card's native input format: images are passed
         # separately and each image is represented by one <image> marker in conv.
         conversation = [

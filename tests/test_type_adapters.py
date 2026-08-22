@@ -103,6 +103,8 @@ class TypeAdapterDataTest(unittest.TestCase):
         ):
             args = parse_args()
         self.assertEqual(args.question_form, "MC")
+        self.assertEqual(args.epochs, 10)
+        self.assertEqual(args.early_stopping_patience, 2)
 
 
 class TypeAdapterPeftTest(unittest.TestCase):

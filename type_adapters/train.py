@@ -39,6 +39,8 @@ SELECTION_METRICS = {
     "SA": "sa_exact_match",
     "LA": "descriptive_avg",
 }
+DEFAULT_TYPE_EPOCHS = 10
+DEFAULT_EARLY_STOPPING_PATIENCE = 2
 
 
 def parse_args() -> argparse.Namespace:
@@ -71,7 +73,7 @@ def parse_args() -> argparse.Namespace:
         help="Root where one run directory containing mc/sa/la_adapter is created",
     )
 
-    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--epochs", type=int, default=DEFAULT_TYPE_EPOCHS)
     parser.add_argument("--train-batch-size", type=int, default=1)
     parser.add_argument("--eval-batch-size", type=int, default=1)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
@@ -79,7 +81,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=0.03)
     parser.add_argument("--warmup-ratio", type=float, default=0.10)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
-    parser.add_argument("--early-stopping-patience", type=int, default=2)
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=DEFAULT_EARLY_STOPPING_PATIENCE,
+        help=(
+            "Stop a branch after this many consecutive epochs without improvement "
+            "in its question-form validation metric"
+        ),
+    )
     parser.add_argument("--max-length", type=int, default=4096)
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--num-workers", type=int, default=2)

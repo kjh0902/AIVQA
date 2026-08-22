@@ -5,6 +5,9 @@ from .data import (
     GenerationCollator,
     KananaVQADataset,
     TrainCollator,
+    build_question_form_instruction,
+    build_sa_instruction,
+    extract_sa_constraints,
     format_question,
 )
 from .metrics import compute_vqa_metrics
@@ -14,6 +17,9 @@ __all__ = [
     "GenerationCollator",
     "KananaVQADataset",
     "TrainCollator",
+    "build_question_form_instruction",
+    "build_sa_instruction",
+    "extract_sa_constraints",
     "format_question",
     "compute_vqa_metrics",
 ]

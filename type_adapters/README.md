@@ -10,7 +10,8 @@ rank, alpha, dropout과 target module은 Shared Adapter 설정을 그대로 이�
 
 - `--shared-adapter-dir`: 기존 Shared 학습 결과의 `best_adapter/`
 - 기본 데이터: `datasets/한국문화 멀티모달 질의응답/`의 train/validation/test JSON
-- 기본 학습값: 3 epochs, learning rate `2e-5`, effective batch size 8
+- 기본 학습값: 최대 10 epochs, learning rate `2e-5`, effective batch size 8
+- 유형별 validation 지표가 2 epochs 연속 개선되지 않으면 조기 종료
 - VRAM이 부족하면 `--load-in-4bit`를 추가합니다.
 
 ## 세 Adapter 일괄 학습
