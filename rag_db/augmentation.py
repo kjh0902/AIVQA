@@ -7,7 +7,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from aivqa.constrained_decoding import get_sa_length_constraint
+from aivqa.sa_validation import generate_with_sa_retries
 
 from .prompts import Candidate, build_answer_feature, build_search_feature
 
@@ -279,18 +279,27 @@ def generate_rag_predictions(
     predictions: list[str] = []
     for index in tqdm(range(len(dataset)), desc=description, unit="sample"):
         sample = dataset[index]
-        length_spec = get_sa_length_constraint(
-            sample.get("question_form"), str(sample.get("question", ""))
+        initial_answer = generate_one(
+            model,
+            processor,
+            sample,
+            max_length,
+            max_new_tokens,
+            dtype,
         )
         predictions.append(
-            generate_one(
-                model,
-                processor,
+            generate_with_sa_retries(
                 sample,
-                max_length,
-                max_new_tokens,
-                dtype,
-                length_spec=length_spec,
+                initial_answer,
+                lambda retry_feature: generate_one(
+                    model,
+                    processor,
+                    retry_feature,
+                    max_length,
+                    max_new_tokens,
+                    dtype,
+                ),
+                max_retries=2,
             )
         )
     return predictions

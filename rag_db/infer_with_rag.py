@@ -21,12 +21,8 @@ from sentence_transformers import SentenceTransformer
 from tqdm.auto import tqdm
 from transformers import AutoProcessor, CLIPModel
 
-from aivqa.constrained_decoding import (
-    KoreanLengthLogitsProcessor,
-    LengthSpec,
-    get_sa_length_constraint,
-)
 from aivqa.data import KananaVQADataset
+from aivqa.sa_validation import generate_with_sa_retries
 from train_lora import (
     DATASET_DIR,
     DATASET_NAME,
@@ -686,22 +682,12 @@ def generate_one(
     max_length: int,
     max_new_tokens: int,
     dtype: Any,
-    length_spec: LengthSpec | None = None,
 ) -> str:
     model.eval()
     device = _model_input_device(model)
     batch = _move_batch_to_device(
         collate_generation_feature(processor, feature, max_length), device
     )
-    generation_options: dict[str, Any] = {}
-    if length_spec is not None:
-        generation_options["logits_processor"] = [
-            KoreanLengthLogitsProcessor(
-                processor.tokenizer,
-                [length_spec],
-                processor.tokenizer.eos_token_id,
-            )
-        ]
     with torch.no_grad(), torch.autocast(device_type="cuda", dtype=dtype):
         generated_ids = model.generate(
             **batch,
@@ -711,7 +697,6 @@ def generate_one(
             use_cache=True,
             pad_token_id=processor.tokenizer.pad_token_id,
             eos_token_id=processor.tokenizer.eos_token_id,
-            **generation_options,
         )
     return processor.batch_decode(
         generated_ids.detach().cpu(),
@@ -836,22 +821,36 @@ def run_inference(args: argparse.Namespace) -> list[str]:
             options = model_input.get("options", [])
             if not isinstance(options, list):
                 raise ValueError(f"Sample {index}: model_input.options must be a list")
+            answer_feature = {
+                **sample,
+                **build_answer_feature(
+                    sample,
+                    question,
+                    options,
+                    all_candidates[index],
+                ),
+            }
+            initial_answer = generate_one(
+                model,
+                processor,
+                answer_feature,
+                args.max_length,
+                args.answer_max_new_tokens,
+                dtype,
+            )
             predictions.append(
-                generate_one(
-                    model,
-                    processor,
-                    build_answer_feature(
-                        sample,
-                        question,
-                        options,
-                        all_candidates[index],
+                generate_with_sa_retries(
+                    answer_feature,
+                    initial_answer,
+                    lambda retry_feature: generate_one(
+                        model,
+                        processor,
+                        retry_feature,
+                        args.max_length,
+                        args.answer_max_new_tokens,
+                        dtype,
                     ),
-                    args.max_length,
-                    args.answer_max_new_tokens,
-                    dtype,
-                    length_spec=get_sa_length_constraint(
-                        sample["question_form"], question
-                    ),
+                    max_retries=2,
                 )
             )
     finally:

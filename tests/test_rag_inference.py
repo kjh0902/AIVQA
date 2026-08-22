@@ -228,22 +228,35 @@ class RagPromptAndDatasetTest(unittest.TestCase):
         self.assertIn("RAG 참고정보:\n검색 본문", first["conversation"][-1]["content"])
         self.assertNotIn("RAG 참고정보", augmented[1]["conversation"][-1]["content"])
 
-    def test_final_rag_generation_passes_constraint_only_for_sa(self) -> None:
+    def test_final_rag_generation_retries_only_invalid_constrained_sa(self) -> None:
         calls = []
         fake_inference = ModuleType("rag_db.infer_with_rag")
+        outputs = iter(("오답", "정답값", "정답", "자유 답변"))
 
         def generate_one(*args, **kwargs):
-            calls.append(kwargs)
-            return "정답"
+            calls.append((args, kwargs))
+            return next(outputs)
 
         fake_inference.generate_one = generate_one
         fake_tqdm = ModuleType("tqdm")
         fake_tqdm_auto = ModuleType("tqdm.auto")
         fake_tqdm_auto.tqdm = lambda iterable, **kwargs: iterable
         dataset = [
-            {"question_form": "SA", "question": "3음절로 답하시오."},
-            {"question_form": "MC", "question": "3음절로 답하시오."},
-            {"question_form": "SA", "question": "조건 없이 답하시오."},
+            {
+                "question_form": "SA",
+                "question": "3음절로 답하시오.",
+                "conversation": [],
+            },
+            {
+                "question_form": "MC",
+                "question": "3음절로 답하시오.",
+                "conversation": [],
+            },
+            {
+                "question_form": "SA",
+                "question": "조건 없이 답하시오.",
+                "conversation": [],
+            },
         ]
         with patch.dict(
             sys.modules,
@@ -263,10 +276,12 @@ class RagPromptAndDatasetTest(unittest.TestCase):
                 description="test",
             )
 
-        self.assertEqual(predictions, ["정답", "정답", "정답"])
-        self.assertEqual(calls[0]["length_spec"], ("syllable", 3))
-        self.assertIsNone(calls[1]["length_spec"])
-        self.assertIsNone(calls[2]["length_spec"])
+        self.assertEqual(predictions, ["정답값", "정답", "자유 답변"])
+        self.assertEqual(len(calls), 4)
+        self.assertTrue(all(kwargs == {} for _, kwargs in calls))
+        retry_feature = calls[1][0][2]
+        self.assertEqual(retry_feature["conversation"][-2]["content"], "오답")
+        self.assertIn("3음절", retry_feature["conversation"][-1]["content"])
 
     def test_rag_search_generation_never_receives_length_constraint(self) -> None:
         calls = []
