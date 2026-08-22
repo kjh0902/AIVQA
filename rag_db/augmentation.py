@@ -3,11 +3,119 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from aivqa.sa_validation import generate_with_sa_retries
+
 from .prompts import Candidate, build_answer_feature, build_search_feature
+
+
+RAG_CACHE_DIR = Path("rag_cache")
+RAG_CACHE_FILENAMES = {
+    "train": "train.json",
+    "validation": "validation.json",
+    "test": "test.json",
+}
+
+
+def rag_cache_paths(cache_dir: Path = RAG_CACHE_DIR) -> dict[str, Path]:
+    """Return the fixed cache file for every dataset split."""
+    return {
+        split: cache_dir / filename
+        for split, filename in RAG_CACHE_FILENAMES.items()
+    }
+
+
+def _dataset_question_ids(dataset: Any) -> list[str]:
+    records = getattr(dataset, "records", None)
+    if not isinstance(records, Sequence) or len(records) != len(dataset):
+        raise TypeError("RAG cache datasets must expose a matching records sequence")
+
+    question_ids: list[str] = []
+    for index, record in enumerate(records):
+        if not isinstance(record, Mapping):
+            raise ValueError(f"Sample {index}: record must be an object")
+        metadata = record.get("metadata")
+        if not isinstance(metadata, Mapping):
+            raise ValueError(f"Sample {index}: metadata must be an object")
+        question_ids.append(str(metadata.get("question_id", index)))
+    return question_ids
+
+
+def load_rag_cache(cache_path: Path, dataset: Any) -> list[list[Candidate]]:
+    """Load a split cache and verify that it exactly matches ``dataset`` order."""
+    if not cache_path.is_file():
+        raise FileNotFoundError(
+            f"Required RAG cache does not exist: {cache_path}. "
+            "Run `python build_rag_cache.py` first."
+        )
+    try:
+        rows = json.loads(cache_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise ValueError(f"Invalid RAG cache JSON: {cache_path}") from error
+    if not isinstance(rows, list):
+        raise ValueError(f"RAG cache root must be a list: {cache_path}")
+
+    expected_ids = _dataset_question_ids(dataset)
+    if len(rows) != len(expected_ids):
+        raise ValueError(
+            f"RAG cache length mismatch for {cache_path}: "
+            f"{len(rows)} rows for {len(expected_ids)} samples"
+        )
+
+    all_candidates: list[list[Candidate]] = []
+    for index, (row, expected_id) in enumerate(zip(rows, expected_ids)):
+        if not isinstance(row, Mapping):
+            raise ValueError(f"RAG cache row {index} must be an object: {cache_path}")
+        actual_id = str(row.get("question_id", ""))
+        if actual_id != expected_id:
+            raise ValueError(
+                f"RAG cache question_id mismatch at row {index}: "
+                f"expected {expected_id!r}, got {actual_id!r}"
+            )
+        serialized_candidates = row.get("candidates")
+        if not isinstance(serialized_candidates, list):
+            raise ValueError(f"RAG cache row {index}.candidates must be a list")
+
+        candidates: list[Candidate] = []
+        for candidate_index, item in enumerate(serialized_candidates):
+            if not isinstance(item, Mapping):
+                raise ValueError(
+                    f"RAG cache row {index} candidate {candidate_index} "
+                    "must be an object"
+                )
+            payload = item.get("payload")
+            if not isinstance(payload, dict):
+                raise ValueError(
+                    f"RAG cache row {index} candidate {candidate_index}.payload "
+                    "must be an object"
+                )
+            doc_id = item.get("doc_id")
+            if not isinstance(doc_id, str) or not doc_id:
+                raise ValueError(
+                    f"RAG cache row {index} candidate {candidate_index}.doc_id "
+                    "must be non-empty"
+                )
+            try:
+                text_score = float(item.get("text_score", 0.0))
+                image_score = float(item.get("image_score", 0.0))
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    f"RAG cache row {index} candidate {candidate_index} has "
+                    "invalid scores"
+                ) from error
+            candidates.append(
+                Candidate(
+                    doc_id=doc_id,
+                    payload=payload,
+                    text_score=text_score,
+                    image_score=image_score,
+                )
+            )
+        all_candidates.append(candidates)
+    return all_candidates
 
 
 class CombinedVQADataset:
@@ -168,14 +276,30 @@ def generate_rag_predictions(
     from .infer_with_rag import generate_one
     from tqdm.auto import tqdm
 
-    return [
-        generate_one(
+    predictions: list[str] = []
+    for index in tqdm(range(len(dataset)), desc=description, unit="sample"):
+        sample = dataset[index]
+        initial_answer = generate_one(
             model,
             processor,
-            dataset[index],
+            sample,
             max_length,
             max_new_tokens,
             dtype,
         )
-        for index in tqdm(range(len(dataset)), desc=description, unit="sample")
-    ]
+        predictions.append(
+            generate_with_sa_retries(
+                sample,
+                initial_answer,
+                lambda retry_feature: generate_one(
+                    model,
+                    processor,
+                    retry_feature,
+                    max_length,
+                    max_new_tokens,
+                    dtype,
+                ),
+                max_retries=2,
+            )
+        )
+    return predictions

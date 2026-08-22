@@ -8,7 +8,12 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from aivqa.data import GenerationCollator, KananaVQADataset, TrainCollator
+from aivqa.data import (
+    GenerationCollator,
+    KananaVQADataset,
+    TrainCollator,
+    extract_sa_constraints,
+)
 
 
 class _FakeProcessor:
@@ -85,7 +90,10 @@ class DatasetTest(unittest.TestCase):
                 },
                 "model_input": {
                     "image_name": "sa.jpg",
-                    "question": "무엇인가요?",
+                    "question": (
+                        "사진 속 창살에서 찾을 수 있는 도형 중 정사각형 외의 도형을 "
+                        "찾아 4음절로 답하시오."
+                    ),
                     "options": [],
                 },
                 "model_output": {"answer": "정답"},
@@ -145,7 +153,9 @@ class DatasetTest(unittest.TestCase):
         prompts = [sample["conversation"][0]["content"] for sample in samples]
 
         self.assertIn("오름차순", prompts[0])
-        self.assertIn("음절 수, 어절 수, 답의 개수", prompts[1])
+        self.assertIn("이 문제는 단답형입니다.", prompts[1])
+        self.assertIn("- 요구 음절 수: 4음절", prompts[1])
+        self.assertIn("최종 답변이 위 조건을 만족하는지", prompts[1])
         self.assertIn("250자 이내의 한 문단", prompts[2])
         self.assertEqual(len(set(prompts)), 3)
 
@@ -156,6 +166,38 @@ class DatasetTest(unittest.TestCase):
                 sample["conv"][0]["content"] for sample in processor.calls[0][0]
             ]
             self.assertEqual(collated_prompts, prompts)
+
+    def test_sa_constraint_parser_supports_all_requested_units(self) -> None:
+        question = (
+            "첫 답은 2음절, 둘째 답은 3어절로 쓰고, 이유 4가지를 답하시오. "
+            "이칭 5개를 나열하시오. 마지막으로 6답하시오."
+        )
+        self.assertEqual(
+            extract_sa_constraints(question),
+            [
+                ("음절 수", "2음절"),
+                ("어절 수", "3어절"),
+                ("답변 개수", "4가지"),
+                ("답변 개수", "5개"),
+                ("답 수", "6답"),
+            ],
+        )
+
+    def test_sa_constraint_parser_ignores_descriptive_object_counts(self) -> None:
+        question = (
+            "사진 속 문구는 물체의 개수가 2개임을 뜻한다. "
+            "4개의 그릇 중 하나의 이름을 3음절로 답하시오."
+        )
+        self.assertEqual(
+            extract_sa_constraints(question),
+            [("음절 수", "3음절")],
+        )
+
+    def test_sa_constraint_parser_supports_korean_count_words(self) -> None:
+        self.assertEqual(
+            extract_sa_constraints("식품의 이름을 두 음절로 답하시오."),
+            [("음절 수", "두 음절")],
+        )
 
     def test_collator_uses_native_sample_shape_and_reuses_image(self) -> None:
         sample = self.dataset[0]

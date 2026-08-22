@@ -22,6 +22,7 @@ from tqdm.auto import tqdm
 from transformers import AutoProcessor, CLIPModel
 
 from aivqa.data import KananaVQADataset
+from aivqa.sa_validation import generate_with_sa_retries
 from train_lora import (
     DATASET_DIR,
     DATASET_NAME,
@@ -820,19 +821,36 @@ def run_inference(args: argparse.Namespace) -> list[str]:
             options = model_input.get("options", [])
             if not isinstance(options, list):
                 raise ValueError(f"Sample {index}: model_input.options must be a list")
+            answer_feature = {
+                **sample,
+                **build_answer_feature(
+                    sample,
+                    question,
+                    options,
+                    all_candidates[index],
+                ),
+            }
+            initial_answer = generate_one(
+                model,
+                processor,
+                answer_feature,
+                args.max_length,
+                args.answer_max_new_tokens,
+                dtype,
+            )
             predictions.append(
-                generate_one(
-                    model,
-                    processor,
-                    build_answer_feature(
-                        sample,
-                        question,
-                        options,
-                        all_candidates[index],
+                generate_with_sa_retries(
+                    answer_feature,
+                    initial_answer,
+                    lambda retry_feature: generate_one(
+                        model,
+                        processor,
+                        retry_feature,
+                        args.max_length,
+                        args.answer_max_new_tokens,
+                        dtype,
                     ),
-                    args.max_length,
-                    args.answer_max_new_tokens,
-                    dtype,
+                    max_retries=2,
                 )
             )
     finally:
