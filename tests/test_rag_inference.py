@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
@@ -12,6 +15,8 @@ from rag_db.augmentation import (
     CombinedVQADataset,
     RagAugmentedDataset,
     generate_rag_predictions,
+    load_rag_cache,
+    rag_cache_paths,
     retrieve_dataset_candidates,
 )
 from rag_db.prompts import Candidate, build_answer_feature, build_search_feature
@@ -97,6 +102,70 @@ class _FakeQdrant:
 
 
 class RagPromptAndDatasetTest(unittest.TestCase):
+    def test_fixed_cache_paths_cover_all_splits(self) -> None:
+        self.assertEqual(
+            rag_cache_paths(Path("rag_cache")),
+            {
+                "train": Path("rag_cache/train.json"),
+                "validation": Path("rag_cache/validation.json"),
+                "test": Path("rag_cache/test.json"),
+            },
+        )
+
+    def test_rag_cache_loader_restores_candidates_and_checks_order(self) -> None:
+        class Dataset:
+            records = [
+                {"metadata": {"question_id": "q1"}},
+                {"metadata": {"question_id": "q2"}},
+            ]
+
+            def __len__(self):
+                return len(self.records)
+
+        rows = [
+            {
+                "question_id": "q1",
+                "search_terms": ["검색어"],
+                "candidates": [
+                    {
+                        "doc_id": "doc",
+                        "text_score": 0.9,
+                        "image_score": 0.8,
+                        "final_score": 1.7,
+                        "payload": _payload("doc", "제목"),
+                    }
+                ],
+            },
+            {"question_id": "q2", "search_terms": [], "candidates": []},
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = Path(temp_dir) / "train.json"
+            cache_path.write_text(
+                json.dumps(rows, ensure_ascii=False), encoding="utf-8"
+            )
+            candidates = load_rag_cache(cache_path, Dataset())
+            self.assertEqual(candidates[0][0].doc_id, "doc")
+            self.assertAlmostEqual(candidates[0][0].final_score, 1.7)
+            self.assertEqual(candidates[1], [])
+
+            rows[0]["question_id"] = "wrong"
+            cache_path.write_text(
+                json.dumps(rows, ensure_ascii=False), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "question_id mismatch"):
+                load_rag_cache(cache_path, Dataset())
+
+    def test_rag_cache_loader_fails_when_cache_is_missing(self) -> None:
+        class Dataset:
+            records = []
+
+            def __len__(self):
+                return 0
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaisesRegex(FileNotFoundError, "build_rag_cache.py"):
+                load_rag_cache(Path(temp_dir) / "test.json", Dataset())
+
     def test_search_prompt_uses_only_image_and_question(self) -> None:
         sample = {"image": Image.new("RGB", (4, 4))}
         feature = build_search_feature(sample, "경복궁의 건물은 무엇인가?")

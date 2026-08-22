@@ -23,26 +23,29 @@ Answer
 
 ## 전체 RAG 학습 및 추론 파이프라인
 
-다음 명령 하나로 RAG 로드부터 `answer.json` 생성까지 순서대로 실행합니다.
+RAG retrieval cache 생성과 학습/추론을 분리해 다음 순서로 실행합니다.
 
 ```bash
+python build_rag_cache.py
 python run_rag_pipeline.py
 ```
 
 실행 순서는 고정되어 있습니다.
 
-1. KURE/CLIP RAG encoder와 기존 Qdrant collection을 로드합니다.
-2. Base Kanana가 train+validation 각 sample의 검색어를 생성하고 text/image RAG
-   결과를 prompt에 추가합니다. 검색어 생성에는 어떤 LoRA도 사용하지 않습니다.
+1. `build_rag_cache.py`가 KURE/CLIP encoder와 기존 Qdrant collection을 로드하고,
+   Base Kanana로 train/validation/test 검색어를 생성합니다. 결과는 고정 경로인
+   `rag_cache/train.json`, `validation.json`, `test.json`에 저장합니다.
+2. `run_rag_pipeline.py`는 retrieval을 수행하지 않고 세 cache를 검증·로드합니다.
+   cache가 하나라도 없으면 모델을 로드하거나 학습 output을 만들기 전에 종료합니다.
 3. train+validation 전체로 Shared LoRA를 validation 없이 정확히 2 epoch 학습하고
    마지막 checkpoint를 `shared_adapter/`에 저장합니다.
-4. 유형별 train/validation에도 2단계에서 Base Kanana가 만든 RAG context를 그대로
+4. 유형별 train/validation에도 cache의 RAG context를 그대로
    사용합니다.
 5. 동일한 Shared Adapter에서 MC, SA, LA를 각각 독립적으로 분기해 최대 10 epoch
    학습합니다. 매 epoch validation을 수행하고 유형별 지표가 2 epoch 연속 개선되지
    않으면 조기 종료하며, 유형별 best Adapter를 저장합니다.
-6. Test 검색어는 Base Kanana로 생성하고, 문항 유형에 맞는 best Adapter는 RAG 최종
-   답변 생성에만 사용합니다.
+6. Test cache를 유형별 원본 인덱스에 맞춰 나누고, 문항 유형에 맞는 best Adapter로
+   RAG 최종 답변만 생성합니다.
 7. 원본 test 레코드 순서를 보존한 제출 파일을 `answer.json`으로 저장합니다.
 
 기본 출력 구조는 다음과 같습니다.
@@ -53,18 +56,24 @@ outputs/kanana_1_5_v_3b_rag_pipeline/run_YYYYMMDD_HHMMSS/
 ├── mc_adapter/
 ├── sa_adapter/
 ├── la_adapter/
-├── rag_cache/
 ├── pipeline_summary.json
 └── answer.json
+
+rag_cache/
+├── train.json
+├── validation.json
+└── test.json
 ```
 
 학습 VRAM을 보존하기 위해 RAG encoder는 기본적으로 CPU에 둡니다. 별도 Qdrant
-server나 RAG GPU를 사용하려면 다음처럼 지정할 수 있습니다.
+server나 RAG GPU를 사용하려면 cache 생성 명령에 지정합니다.
 
 ```bash
-python run_rag_pipeline.py \
+python build_rag_cache.py \
   --qdrant-url http://localhost:6333 \
   --rag-device cuda
+
+python run_rag_pipeline.py
 ```
 
 RAG context는 검색 점수 상위 3개 문서에서 만들며 긴 학습 prompt를 제한하기 위해
