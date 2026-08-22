@@ -7,6 +7,8 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from aivqa.constrained_decoding import get_sa_length_constraint
+
 from .prompts import Candidate, build_answer_feature, build_search_feature
 
 
@@ -168,14 +170,21 @@ def generate_rag_predictions(
     from .infer_with_rag import generate_one
     from tqdm.auto import tqdm
 
-    return [
-        generate_one(
-            model,
-            processor,
-            dataset[index],
-            max_length,
-            max_new_tokens,
-            dtype,
+    predictions: list[str] = []
+    for index in tqdm(range(len(dataset)), desc=description, unit="sample"):
+        sample = dataset[index]
+        length_spec = get_sa_length_constraint(
+            sample.get("question_form"), str(sample.get("question", ""))
         )
-        for index in tqdm(range(len(dataset)), desc=description, unit="sample")
-    ]
+        predictions.append(
+            generate_one(
+                model,
+                processor,
+                sample,
+                max_length,
+                max_new_tokens,
+                dtype,
+                length_spec=length_spec,
+            )
+        )
+    return predictions

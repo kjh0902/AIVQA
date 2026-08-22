@@ -13,6 +13,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+from aivqa.constrained_decoding import (
+    KoreanLengthLogitsProcessor,
+    get_sa_length_constraint,
+)
 from aivqa.data import GenerationCollator, KananaVQADataset, TrainCollator
 from aivqa.metrics import compute_vqa_metrics
 from training_logger import TrainingLogger
@@ -487,6 +491,21 @@ def generate_predictions(
             leave=False,
         ):
             batch = _move_batch_to_device(collator(features), device)
+            length_specs = [
+                get_sa_length_constraint(
+                    feature.get("question_form"), str(feature["question"])
+                )
+                for feature in features
+            ]
+            generation_options: dict[str, Any] = {}
+            if any(spec is not None for spec in length_specs):
+                generation_options["logits_processor"] = [
+                    KoreanLengthLogitsProcessor(
+                        processor.tokenizer,
+                        length_specs,
+                        processor.tokenizer.eos_token_id,
+                    )
+                ]
             with torch.autocast(device_type="cuda", dtype=dtype):
                 generated_ids = model.generate(
                     **batch,
@@ -496,6 +515,7 @@ def generate_predictions(
                     use_cache=True,
                     pad_token_id=processor.tokenizer.pad_token_id,
                     eos_token_id=processor.tokenizer.eos_token_id,
+                    **generation_options,
                 )
             # The native multimodal generate path passes inputs_embeds to the
             # LLM, so it returns answer token IDs without the prompt prefix.

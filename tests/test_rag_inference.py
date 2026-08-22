@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 import unittest
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
-from rag_db.augmentation import CombinedVQADataset, RagAugmentedDataset
+from rag_db.augmentation import (
+    CombinedVQADataset,
+    RagAugmentedDataset,
+    generate_rag_predictions,
+    retrieve_dataset_candidates,
+)
 from rag_db.prompts import Candidate, build_answer_feature, build_search_feature
 
 RUNTIME_DEPENDENCIES = ("torch", "qdrant_client", "sentence_transformers", "transformers")
@@ -151,6 +158,94 @@ class RagPromptAndDatasetTest(unittest.TestCase):
         self.assertEqual(first["answer"], "정답 0")
         self.assertIn("RAG 참고정보:\n검색 본문", first["conversation"][-1]["content"])
         self.assertNotIn("RAG 참고정보", augmented[1]["conversation"][-1]["content"])
+
+    def test_final_rag_generation_passes_constraint_only_for_sa(self) -> None:
+        calls = []
+        fake_inference = ModuleType("rag_db.infer_with_rag")
+
+        def generate_one(*args, **kwargs):
+            calls.append(kwargs)
+            return "정답"
+
+        fake_inference.generate_one = generate_one
+        fake_tqdm = ModuleType("tqdm")
+        fake_tqdm_auto = ModuleType("tqdm.auto")
+        fake_tqdm_auto.tqdm = lambda iterable, **kwargs: iterable
+        dataset = [
+            {"question_form": "SA", "question": "3음절로 답하시오."},
+            {"question_form": "MC", "question": "3음절로 답하시오."},
+            {"question_form": "SA", "question": "조건 없이 답하시오."},
+        ]
+        with patch.dict(
+            sys.modules,
+            {
+                "rag_db.infer_with_rag": fake_inference,
+                "tqdm": fake_tqdm,
+                "tqdm.auto": fake_tqdm_auto,
+            },
+        ):
+            predictions = generate_rag_predictions(
+                object(),
+                object(),
+                dataset,
+                max_length=32,
+                max_new_tokens=8,
+                dtype=None,
+                description="test",
+            )
+
+        self.assertEqual(predictions, ["정답", "정답", "정답"])
+        self.assertEqual(calls[0]["length_spec"], ("syllable", 3))
+        self.assertIsNone(calls[1]["length_spec"])
+        self.assertIsNone(calls[2]["length_spec"])
+
+    def test_rag_search_generation_never_receives_length_constraint(self) -> None:
+        calls = []
+        fake_inference = ModuleType("rag_db.infer_with_rag")
+
+        def generate_one(*args, **kwargs):
+            calls.append(kwargs)
+            return '["검색어"]'
+
+        fake_inference.generate_one = generate_one
+        fake_inference.parse_search_terms = lambda value: ["검색어"]
+        fake_tqdm = ModuleType("tqdm")
+        fake_tqdm_auto = ModuleType("tqdm.auto")
+        fake_tqdm_auto.tqdm = lambda iterable, **kwargs: iterable
+
+        class Retriever:
+            @staticmethod
+            def retrieve(search_terms, image):
+                return []
+
+        dataset = [
+            {
+                "question_id": "1",
+                "question_form": "SA",
+                "question": "3음절로 답하시오.",
+                "image": Image.new("RGB", (4, 4)),
+            }
+        ]
+        with patch.dict(
+            sys.modules,
+            {
+                "rag_db.infer_with_rag": fake_inference,
+                "tqdm": fake_tqdm,
+                "tqdm.auto": fake_tqdm_auto,
+            },
+        ):
+            retrieve_dataset_candidates(
+                object(),
+                object(),
+                dataset,
+                Retriever(),
+                max_length=32,
+                search_max_new_tokens=8,
+                dtype=None,
+                description="test",
+            )
+
+        self.assertEqual(calls, [{}])
 
 
 @unittest.skipUnless(
