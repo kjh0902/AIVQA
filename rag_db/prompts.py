@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from typing import Any, Sequence
 
 from aivqa.data import (
-    QUESTION_FORM_INSTRUCTIONS,
     SYSTEM_PROMPT,
+    build_question_form_instruction,
     format_question,
 )
 
@@ -66,7 +66,8 @@ def build_answer_feature(
 ) -> dict[str, Any]:
     question_form = sample["question_form"]
     system_prompt = (
-        f"{SYSTEM_PROMPT}\n\n{QUESTION_FORM_INSTRUCTIONS[question_form]}\n\n"
+        f"{SYSTEM_PROMPT}\n\n"
+        f"{build_question_form_instruction(question_form, question)}\n\n"
         f"{REFERENCE_CAUTION}"
     )
     parts = [format_question(question_form, question, options)]
