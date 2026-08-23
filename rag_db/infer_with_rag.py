@@ -850,7 +850,7 @@ def run_inference(args: argparse.Namespace) -> list[str]:
                         args.answer_max_new_tokens,
                         dtype,
                     ),
-                    max_retries=2,
+                    max_retries=3,
                 )
             )
     finally:

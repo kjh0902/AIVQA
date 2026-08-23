@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 
-Mode = Literal["none", "contains", "only"]
 LengthUnit = Literal["syllable", "eojeol"]
 
 _COUNT_WORDS = {
@@ -27,19 +26,16 @@ _COUNT_WORDS = {
 _COUNT_TOKEN = r"\d+|" + "|".join(_COUNT_WORDS)
 _LENGTH_RE = re.compile(
     rf"(?<![\d.가-힣])(?P<count>{_COUNT_TOKEN})\s*(?P<unit>음절|어절)"
+    r"\s*(?P<minimum>이상)?"
 )
 _OUTPUT_VERB = r"(?:답하|작성하|쓰|적|기입하|제시하|나열하)"
-_CJK_RANGES = (
-    ("\u3400", "\u4dbf"),
-    ("\u4e00", "\u9fff"),
-    ("\uf900", "\ufaff"),
-)
 
 
 @dataclass(frozen=True)
 class LengthRequirement:
     unit: LengthUnit
     count: int
+    minimum: bool = False
 
     @property
     def korean_unit(self) -> str:
@@ -48,30 +44,15 @@ class LengthRequirement:
 
 @dataclass(frozen=True)
 class SAFormatSpec:
-    """Structured format constraints parsed from one SA question."""
+    """Syllable and eojeol constraints parsed from one SA question."""
 
     length_groups: tuple[tuple[LengthRequirement, ...], ...] = ()
-    numeric_mode: Mode = "none"
-    hanja_mode: Mode = "none"
-    english_mode: Mode = "none"
-    require_hangul: bool = False
-    unit_mode: Literal["none", "include", "exclude"] = "none"
-    unit_text: str | None = None
     answer_count: int | None = None
+    alternatives: bool = False
 
     @property
     def is_free(self) -> bool:
-        return not any(
-            (
-                self.length_groups,
-                self.numeric_mode != "none",
-                self.hanja_mode != "none",
-                self.english_mode != "none",
-                self.require_hangul,
-                self.unit_mode != "none",
-                self.answer_count is not None,
-            )
-        )
+        return not self.length_groups
 
 
 @dataclass(frozen=True)
@@ -92,6 +73,7 @@ def _parse_length_groups(question: str) -> tuple[tuple[LengthRequirement, ...], 
         LengthRequirement(
             "syllable" if match.group("unit") == "음절" else "eojeol",
             _parse_count(match.group("count")),
+            minimum=match.group("minimum") is not None,
         )
         for match in matches
     ]
@@ -102,8 +84,13 @@ def _parse_length_groups(question: str) -> tuple[tuple[LengthRequirement, ...], 
         question[first.end() : second.start()]
         for first, second in zip(matches, matches[1:])
     ]
-    sequential = bool(re.search(r"각각|차례대로|순서대로", question)) or any(
-        re.search(r"(?:과|와|,|그리고)", text) for text in between
+    alternatives = any(
+        re.search(r"(?:또는|혹은|이나|이거나)", text) for text in between
+    )
+    sequential = not alternatives and (
+        bool(re.search(r"각각|차례대로|차례로|순서대로", question)) or any(
+            re.search(r"(?:과|와|,|그리고)", text) for text in between
+        )
     )
     if sequential:
         groups = [(requirement,) for requirement in requirements]
@@ -142,117 +129,29 @@ def _parse_answer_count(question: str, length_group_count: int) -> int | None:
             return _parse_count(match.group("count"))
     if length_group_count > 1:
         return length_group_count
-    if length_group_count == 1 and re.search(r"각각|차례대로|순서대로", question):
+    if length_group_count == 1 and re.search(
+        rf"각각|차례대로|순서대로|차례로\s*각|"
+        rf"각\s*(?:{_COUNT_TOKEN})\s*(?:음절|어절)\s*씩",
+        question,
+    ):
         return 2
     return None
 
 
-def _parse_script_mode(question: str, label_pattern: str) -> Mode:
-    if re.search(
-        rf"(?:{label_pattern})(?:\s*알파벳)?(?:으로만|만으로|만)\s*{_OUTPUT_VERB}",
-        question,
-    ):
-        return "only"
-    if re.search(
-        rf"(?:{label_pattern})(?:\s*알파벳)?으로\s*{_OUTPUT_VERB}",
-        question,
-    ):
-        return "only"
-    if re.search(rf"(?:{label_pattern})(?:를|을)?\s*포함", question):
-        return "contains"
-    return "none"
-
-
-def _parse_hanja_mode(question: str) -> Mode:
-    if re.search(rf"한자(?:로만|만으로|만|로)\s*{_OUTPUT_VERB}", question):
-        return "only"
-    if re.search(r"한자(?:를|가)?\s*포함", question):
-        return "contains"
-    return "none"
-
-
-def _parse_numeric_mode(question: str) -> Mode:
-    if re.search(r"한글\s*(?:과|와)\s*숫자", question):
-        return "contains"
-    if re.search(r"숫자(?:를|가)?\s*포함", question):
-        return "contains"
-    if re.search(
-        rf"숫자(?:로만|만으로|만|로|를)\s*{_OUTPUT_VERB}", question
-    ):
-        return "only"
-    return "none"
-
-
-def _parse_unit_requirement(
-    question: str,
-) -> tuple[Literal["none", "include", "exclude"], str | None]:
-    if re.search(r"단위\s*(?:없이|제외)", question):
-        return "exclude", None
-    include = re.search(
-        r"단위(?:를|까지)?\s*(?:포함|붙여|써서)|단위(?:와|랑)\s*함께",
-        question,
-    )
-    if include is None:
-        return "none", None
-    unit_match = re.search(
-        r"(?P<unit>km/h|km|kg|cm|mm|m|ml|L|%|원|만원|개월|년|월|일|"
-        r"시간|분|초|명|개|회|번|층|호선)\s*단위",
-        question,
-        flags=re.IGNORECASE,
-    )
-    return "include", unit_match.group("unit") if unit_match else None
-
-
 def parse_sa_format(question: str) -> SAFormatSpec:
-    """Parse deterministic output-format requirements; no match means FREE."""
+    """Parse only syllable and eojeol requirements; no match means FREE."""
     length_groups = _parse_length_groups(question)
-    numeric_mode = _parse_numeric_mode(question)
-    hanja_mode = _parse_hanja_mode(question)
-    english_mode = _parse_script_mode(question, r"영문|영어|알파벳")
-    unit_mode, unit_text = _parse_unit_requirement(question)
     return SAFormatSpec(
         length_groups=length_groups,
-        numeric_mode=numeric_mode,
-        hanja_mode=hanja_mode,
-        english_mode=english_mode,
-        require_hangul=bool(re.search(r"한글\s*(?:과|와)\s*숫자", question)),
-        unit_mode=unit_mode,
-        unit_text=unit_text,
         answer_count=_parse_answer_count(question, len(length_groups)),
+        alternatives=bool(
+            re.search(r"(?:음절|어절)\s*(?:또는|혹은|이나|이거나)", question)
+        ),
     )
-
-
-def _is_hangul_syllable(character: str) -> bool:
-    return "가" <= character <= "힣"
-
-
-def _is_hanja(character: str) -> bool:
-    return any(start <= character <= end for start, end in _CJK_RANGES)
 
 
 def _split_answers(answer: str) -> list[str]:
-    return [
-        part.strip()
-        for part in re.split(r"\s*(?:/|;|\n)\s*|,\s+", answer)
-        if part.strip()
-    ]
-
-
-def _validate_mode(
-    answer: str,
-    *,
-    mode: Mode,
-    label: str,
-    contains: Callable[[str], bool],
-    forbidden_for_only: Callable[[str], bool],
-) -> list[str]:
-    if mode == "none":
-        return []
-    if not any(contains(character) for character in answer):
-        return [f"이전 답변에 질문이 요구한 {label}가 없습니다."]
-    if mode == "only" and any(forbidden_for_only(character) for character in answer):
-        return [f"이전 답변은 {label}만으로 작성되지 않았습니다."]
-    return []
+    return [part.strip() for part in answer.split("/") if part.strip()]
 
 
 def _validate_length(
@@ -267,11 +166,18 @@ def _validate_length(
         actual = sum(character.isalnum() for character in answer)
     else:
         actual = len(answer.split())
-    if actual == requirement.count:
+    if requirement.minimum and actual >= requirement.count:
         return None
+    if not requirement.minimum and actual == requirement.count:
+        return None
+    requested = (
+        f"최소 {requirement.count}{requirement.korean_unit}"
+        if requirement.minimum
+        else f"정확히 {requirement.count}{requirement.korean_unit}"
+    )
     return (
-        f"{prefix}은 {actual}{requirement.korean_unit}이지만 질문은 정확히 "
-        f"{requirement.count}{requirement.korean_unit}을 요구합니다."
+        f"{prefix}은 {actual}{requirement.korean_unit}이지만 질문은 "
+        f"{requested}을 요구합니다."
     )
 
 
@@ -283,62 +189,6 @@ def validate_sa_answer(answer: str, spec: SAFormatSpec) -> ValidationResult:
         return ValidationResult(True)
     if not answer:
         return ValidationResult(False, ("이전 답변이 비어 있습니다.",))
-
-    if re.search(r"(?:^|\s)\d+\s*(?:음|음절|어절)\s*$", answer):
-        reasons.append(
-            "이전 답변 끝에 질문의 길이 조건을 옮겨 쓴 표현이 포함되어 있습니다."
-        )
-
-    reasons.extend(
-        _validate_mode(
-            answer,
-            mode=spec.numeric_mode,
-            label="숫자",
-            contains=str.isdigit,
-            forbidden_for_only=lambda character: character.isalpha(),
-        )
-    )
-    reasons.extend(
-        _validate_mode(
-            answer,
-            mode=spec.hanja_mode,
-            label="한자",
-            contains=_is_hanja,
-            forbidden_for_only=lambda character: (
-                character.isalnum() and not _is_hanja(character)
-            ),
-        )
-    )
-    reasons.extend(
-        _validate_mode(
-            answer,
-            mode=spec.english_mode,
-            label="영문 알파벳",
-            contains=lambda character: character.isascii() and character.isalpha(),
-            forbidden_for_only=lambda character: (
-                (character.isalpha() and not character.isascii())
-                or _is_hanja(character)
-            ),
-        )
-    )
-    if spec.require_hangul and not any(_is_hangul_syllable(char) for char in answer):
-        reasons.append("이전 답변에 질문이 요구한 한글이 없습니다.")
-
-    if spec.unit_mode == "exclude" and any(
-        character.isalpha() or character in "%°" for character in answer
-    ):
-        reasons.append("이전 답변에 단위가 포함되어 있지만 질문은 단위 없는 답을 요구합니다.")
-    elif spec.unit_mode == "include":
-        if spec.unit_text is not None:
-            if spec.unit_text.casefold() not in answer.casefold():
-                reasons.append(
-                    f"이전 답변에 질문이 요구한 단위 {spec.unit_text!r}가 없습니다."
-                )
-        elif not (
-            any(character.isdigit() for character in answer)
-            and any(character.isalpha() or character in "%°" for character in answer)
-        ):
-            reasons.append("이전 답변에 숫자와 단위가 함께 포함되어 있지 않습니다.")
 
     expected_parts = spec.answer_count
     if expected_parts is None and len(spec.length_groups) > 1:
@@ -361,10 +211,13 @@ def validate_sa_answer(answer: str, spec: SAFormatSpec) -> ValidationResult:
             targets = list(zip(parts, spec.length_groups))
         for index, (part, requirements) in enumerate(targets, start=1):
             prefix = "이전 답변" if len(targets) == 1 else f"이전 답변의 {index}번째 답"
-            for requirement in requirements:
-                reason = _validate_length(part, requirement, prefix)
-                if reason is not None:
-                    reasons.append(reason)
+            length_reasons = [
+                reason
+                for requirement in requirements
+                if (reason := _validate_length(part, requirement, prefix)) is not None
+            ]
+            if not spec.alternatives or len(length_reasons) == len(requirements):
+                reasons.extend(length_reasons)
 
     return ValidationResult(not reasons, tuple(reasons))
 
@@ -429,7 +282,7 @@ def generate_with_sa_retries(
     initial_answer: str,
     generate_retry: Callable[[dict[str, Any]], str],
     *,
-    max_retries: int = 2,
+    max_retries: int = 3,
 ) -> str:
     """Retry only constrained SA answers, returning the final model output unchanged."""
     if max_retries < 0:

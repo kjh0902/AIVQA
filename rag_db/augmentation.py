@@ -299,7 +299,7 @@ def generate_rag_predictions(
                     max_new_tokens,
                     dtype,
                 ),
-                max_retries=2,
+                max_retries=3,
             )
         )
     return predictions

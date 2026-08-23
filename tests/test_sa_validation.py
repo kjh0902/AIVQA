@@ -29,6 +29,9 @@ class SAFormatParserAndValidatorTest(unittest.TestCase):
 
     def test_single_syllable_and_eojeol_requirements(self) -> None:
         self.assert_valid("3음절로 답하시오.", "이마트")
+        self.assert_valid("3 음절로 답하시오.", "이마트")
+        self.assert_valid("두 음절로 답하시오.", "단오")
+        self.assert_valid("답하시오. (3어절)", "가 나 다")
         reasons = self.assert_invalid("4음절로 답하시오.", "이마트")
         self.assertIn("3음절", reasons[0])
         self.assert_valid("2어절로 답하시오.", "대한 민국")
@@ -36,17 +39,26 @@ class SAFormatParserAndValidatorTest(unittest.TestCase):
         self.assert_valid("3음절로 답하시오.", "6호선")
         self.assert_valid("2음절로 답하시오.", "LG")
 
-    def test_sequential_and_simultaneous_complex_lengths(self) -> None:
+    def test_multiple_answers_apply_shared_length_to_each_part(self) -> None:
+        question = "두 인물의 이름을 차례로 각 2음절씩 답하시오."
+        spec = parse_sa_format(question)
+        self.assertEqual(spec.answer_count, 2)
+        self.assert_valid(question, "단오/한복")
+        self.assert_invalid(question, "단오/씨름판")
+        self.assert_invalid(question, "단오, 한복")
+
+        counted_question = "2어절 길이의 이칭 3개를 차례대로 답하시오."
+        counted_spec = parse_sa_format(counted_question)
+        self.assertEqual(counted_spec.answer_count, 3)
+        self.assert_valid(counted_question, "가 나/다 라/마 바")
+        self.assert_invalid(counted_question, "가 나/다 라")
+
+    def test_sequential_lengths_for_multiple_answers(self) -> None:
         sequential = parse_sa_format("차례대로 2음절과 3음절로 답하시오.")
         self.assertEqual(len(sequential.length_groups), 2)
         self.assert_valid(
             "차례대로 2음절과 3음절로 답하시오.", "단오/씨름판"
         )
-
-        simultaneous = parse_sa_format("2어절 4음절로 답하시오.")
-        self.assertEqual(len(simultaneous.length_groups), 1)
-        self.assertEqual(len(simultaneous.length_groups[0]), 2)
-        self.assert_valid("2어절 4음절로 답하시오.", "대한 민국")
 
         repeated = parse_sa_format(
             "명칭과 재료는 각각 2음절로 답하고, 지역은 3음절로 답하시오."
@@ -59,30 +71,38 @@ class SAFormatParserAndValidatorTest(unittest.TestCase):
             "명칭/재료/제주도",
         )
 
-    def test_numeric_hanja_and_english_modes(self) -> None:
-        self.assert_valid("단위 없이 숫자로 답하시오.", "3000")
-        self.assert_invalid("단위 없이 숫자로 답하시오.", "3000원")
-        self.assert_valid("한자로 답하시오.", "漢字")
-        self.assert_invalid("한자로 답하시오.", "한자")
-        self.assert_valid("영문 알파벳으로 답하시오.", "KISA")
-        self.assert_invalid("영문 알파벳으로 답하시오.", "키사")
+    def test_simultaneous_syllable_and_eojeol_requirements(self) -> None:
+        simultaneous = parse_sa_format("2어절 4음절로 답하시오.")
+        self.assertEqual(len(simultaneous.length_groups), 1)
+        self.assertEqual(len(simultaneous.length_groups[0]), 2)
+        self.assert_valid("2어절 4음절로 답하시오.", "대한 민국")
+        self.assert_invalid("2어절 4음절로 답하시오.", "대한민국")
+        self.assert_invalid("2어절 4음절로 답하시오.", "대한 민국인")
 
-    def test_contains_and_unit_requirements(self) -> None:
-        self.assert_valid("한글과 숫자로 답하시오.", "코로나19")
-        self.assert_invalid("한글과 숫자로 답하시오.", "코로나")
-        self.assert_valid("숫자와 단위를 포함하여 답하시오.", "10km")
-        self.assert_invalid("숫자와 단위를 포함하여 답하시오.", "10")
+    def test_alternative_length_requirements(self) -> None:
+        question = "장소를 2어절 또는 3음절로 답하시오."
+        self.assert_valid(question, "대한민국 서울")
+        self.assert_valid(question, "이마트")
+        self.assert_invalid(question, "대한민국")
 
-    def test_multiple_answers_apply_shared_length_to_each_part(self) -> None:
-        question = "2어절 길이의 이칭 3개를 차례대로 답하시오."
-        spec = parse_sa_format(question)
-        self.assertEqual(spec.answer_count, 3)
-        self.assert_valid(question, "가 나/다 라/마 바")
-        self.assert_invalid(question, "가 나/다 라")
+    def test_minimum_length_requirement(self) -> None:
+        question = "계산 방법의 이름을 3음절 이상으로 쓰시오."
+        self.assert_valid(question, "이마트")
+        self.assert_valid(question, "롯데마트")
+        reasons = self.assert_invalid(question, "마트")
+        self.assertTrue(any("최소 3음절" in reason for reason in reasons))
 
-    def test_echoed_length_text_is_rejected(self) -> None:
-        reasons = self.assert_invalid("4음절로 답하시오.", "이마트 4음")
-        self.assertTrue(any("길이 조건" in reason for reason in reasons))
+    def test_non_length_formats_are_not_validated(self) -> None:
+        for question in (
+            "단위 없이 숫자로 답하시오.",
+            "한자로 답하시오.",
+            "영문 알파벳으로 답하시오.",
+            "한글과 숫자로 답하시오.",
+            "숫자와 단위를 포함하여 답하시오.",
+        ):
+            spec = parse_sa_format(question)
+            self.assertTrue(spec.is_free)
+            self.assert_valid(question, "어떤 답변이든 그대로 통과")
 
 
 class SARetryTest(unittest.TestCase):
@@ -142,13 +162,13 @@ class SARetryTest(unittest.TestCase):
         )
         self.assertEqual(_conversation(retry_features[0]), retry_conversation)
 
-    def test_retry_runs_at_most_twice_and_returns_last_output_unchanged(self) -> None:
+    def test_retry_runs_at_most_three_times_and_returns_last_output_unchanged(self) -> None:
         feature = {
             "question_form": "SA",
             "question": "4음절로 답하시오.",
             "conversation": [{"role": "user", "content": "원래 프롬프트"}],
         }
-        outputs = iter(("두글자", "세글자"))
+        outputs = iter(("두글자", "세글자", "다섯글자"))
         calls = []
 
         def generate(retry_feature):
@@ -156,8 +176,8 @@ class SARetryTest(unittest.TestCase):
             return next(outputs)
 
         result = generate_with_sa_retries(feature, "한글", generate)
-        self.assertEqual(result, "세글자")
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(result, "다섯글자")
+        self.assertEqual(len(calls), 3)
 
     def test_mc_la_and_free_sa_do_not_retry(self) -> None:
         def fail_if_called(feature):
@@ -167,6 +187,9 @@ class SARetryTest(unittest.TestCase):
             ("MC", "3음절로 답하시오."),
             ("LA", "3음절로 답하시오."),
             ("SA", "조건 없이 답하시오."),
+            ("SA", "단위 없이 숫자로 답하시오."),
+            ("SA", "한자로 답하시오."),
+            ("SA", "영문으로 답하시오."),
         ):
             feature = {
                 "question_form": question_form,
@@ -179,8 +202,9 @@ class SARetryTest(unittest.TestCase):
             )
 
     def test_retry_prompt_includes_each_failure_reason(self) -> None:
-        validation = validate_sa_answer("한글", parse_sa_format("숫자로 답하시오."))
-        prompt = build_sa_retry_prompt("숫자로 답하시오.", "한글", validation)
+        question = "4음절로 답하시오."
+        validation = validate_sa_answer("한글", parse_sa_format(question))
+        prompt = build_sa_retry_prompt(question, "한글", validation)
         for reason in validation.reasons:
             self.assertIn(reason, prompt)
 

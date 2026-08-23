@@ -518,7 +518,7 @@ def generate_predictions(
                         feature,
                         initial_answer,
                         lambda retry_feature: generate_features([retry_feature])[0],
-                        max_retries=2,
+                        max_retries=3,
                     )
                 )
     return predictions
