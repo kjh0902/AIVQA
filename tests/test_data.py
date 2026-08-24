@@ -19,6 +19,39 @@ from aivqa.data import (
 class _FakeProcessor:
     def __init__(self) -> None:
         self.calls = []
+        self.encode_calls = []
+        self.collate_calls = []
+
+    def encode(self, sample, **kwargs):
+        self.assert_sample(sample)
+        self.encode_calls.append((sample, kwargs))
+        has_answer = sample["conv"][-1]["role"] == "assistant"
+        length = 6 if has_answer else 5
+        input_ids = np.arange(1, length + 1, dtype=np.int64)
+        input_ids[2] = -1
+        return {
+            "text": {
+                "input_ids": input_ids,
+                "attention_mask": np.ones(length, dtype=np.int64),
+                "seq_length": length,
+            }
+        }
+
+    def collate(self, encodings, **kwargs):
+        self.collate_calls.append((encodings, kwargs))
+        lengths = [encoding["text"]["input_ids"].size for encoding in encodings]
+        width = max(lengths)
+        input_ids = np.zeros((len(encodings), width), dtype=np.int64)
+        attention_mask = np.zeros_like(input_ids)
+        for row, (encoding, length) in enumerate(zip(encodings, lengths)):
+            input_ids[row, :length] = encoding["text"]["input_ids"]
+            attention_mask[row, :length] = encoding["text"]["attention_mask"]
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "pixel_values": np.ones((len(encodings), 2), dtype=np.float32),
+            "image_metas": {"vision_grid_thw": np.ones((len(encodings), 3))},
+        }
 
     def batch_encode_collate(self, samples, **kwargs):
         self.calls.append((samples, kwargs))
@@ -51,6 +84,40 @@ class _FakeProcessor:
         for message in sample["conv"]:
             if not isinstance(message["content"], str):
                 raise TypeError("conversation content must be text")
+
+
+class _LengthAwareProcessor(_FakeProcessor):
+    """Tiny Kanana-shaped processor that makes every text character one token."""
+
+    def encode(self, sample, **kwargs):
+        self.assert_sample(sample)
+        self.encode_calls.append((sample, kwargs))
+        token_ids = []
+        has_answer = False
+        for message in sample["conv"]:
+            role = message["role"]
+            content = message["content"]
+            if role == "system":
+                token_ids.extend([10] * len(content))
+            elif content == "<image>":
+                token_ids.extend((-1, -1))
+            elif role == "user":
+                token_ids.extend([20] * len(content))
+            else:
+                has_answer = True
+                token_ids.append(40)
+                token_ids.extend([30] * len(content))
+        if kwargs.get("add_generation_prompt") and not has_answer:
+            token_ids.append(40)
+        input_ids = np.asarray(token_ids, dtype=np.int64)
+        return {
+            "text": {
+                "input_ids": input_ids,
+                "attention_mask": np.ones(input_ids.size, dtype=np.int64),
+                "seq_length": input_ids.size,
+            },
+            "sample": sample,
+        }
 
 
 class DatasetTest(unittest.TestCase):
@@ -162,8 +229,13 @@ class DatasetTest(unittest.TestCase):
         for collator_type in (TrainCollator, GenerationCollator):
             processor = _FakeProcessor()
             collator_type(processor)(samples)
+            processor_samples = (
+                [call[0] for call in processor.encode_calls[::2]]
+                if collator_type is TrainCollator
+                else processor.calls[0][0]
+            )
             collated_prompts = [
-                sample["conv"][0]["content"] for sample in processor.calls[0][0]
+                sample["conv"][0]["content"] for sample in processor_samples
             ]
             self.assertEqual(collated_prompts, prompts)
 
@@ -203,22 +275,22 @@ class DatasetTest(unittest.TestCase):
         sample = self.dataset[0]
         processor = _FakeProcessor()
         TrainCollator(processor)([sample])
-        processor_sample = processor.calls[0][0][0]
+        processor_sample = processor.encode_calls[0][0]
         self.assertIs(processor_sample["image"][0], sample["image"])
         self.assertEqual(set(processor_sample), {"image", "conv"})
 
     def test_train_collator_adds_answer_and_masks_prompt_and_image_tokens(self) -> None:
         processor = _FakeProcessor()
         batch = TrainCollator(processor)([self.dataset[0]])
-        full_conversation = processor.calls[0][0][0]["conv"]
+        full_conversation = processor.encode_calls[0][0]["conv"]
         self.assertEqual(
             full_conversation[-1], {"role": "assistant", "content": "2"}
         )
         np.testing.assert_array_equal(
             batch["labels"], [[-100, -100, -100, -100, -100, 6]]
         )
-        self.assertEqual(processor.calls[0][1]["padding_side"], "right")
-        self.assertEqual(processor.calls[0][1]["max_length"], 2048)
+        self.assertEqual(processor.collate_calls[0][1]["padding_side"], "right")
+        self.assertEqual(processor.collate_calls[0][1]["max_length"], 2048)
 
     def test_generation_collator_excludes_answer_and_left_pads(self) -> None:
         processor = _FakeProcessor()
@@ -238,6 +310,83 @@ class DatasetTest(unittest.TestCase):
         sample["answer"] = None
         with self.assertRaisesRegex(ValueError, "Training sample 1"):
             TrainCollator(processor)([sample])
+
+    def test_train_collator_trims_rag_back_before_encoding_to_max_length(self) -> None:
+        processor = _LengthAwareProcessor()
+        sample = self.dataset[1]
+        original_question = sample["conversation"][-1]["content"]
+        rag_context = "가나다라마바사아자차카타파하" * 10
+        sample["conversation"][-1]["content"] += (
+            "\n\nRAG 참고정보:\n" + rag_context
+        )
+        mandatory_length = (
+            len(sample["conversation"][0]["content"])
+            + 2
+            + len(original_question)
+            + 1
+            + len(sample["answer"])
+        )
+        max_length = mandatory_length + 30
+
+        batch = TrainCollator(processor, max_length=max_length)([sample])
+
+        full_encoding = processor.collate_calls[0][0][0]
+        full_conversation = full_encoding["sample"]["conv"]
+        truncated_user = full_conversation[-2]["content"]
+        kept_rag = truncated_user.split("\n\nRAG 참고정보:\n", 1)[1]
+        self.assertEqual(
+            full_conversation[0]["content"],
+            sample["conversation"][0]["content"],
+        )
+        self.assertTrue(truncated_user.startswith(original_question))
+        self.assertTrue(rag_context.startswith(kept_rag))
+        self.assertLess(len(kept_rag), len(rag_context))
+        self.assertEqual(
+            full_conversation[-1],
+            {"role": "assistant", "content": sample["answer"]},
+        )
+        self.assertLessEqual(batch["input_ids"].shape[1], max_length)
+        self.assertEqual(int((batch["input_ids"] < 0).sum()), 2)
+        self.assertTrue(
+            all(call[1]["max_length"] is None for call in processor.encode_calls)
+        )
+        np.testing.assert_array_equal(
+            batch["labels"][batch["labels"] != -100],
+            [30] * len(sample["answer"]),
+        )
+
+    def test_train_collator_never_truncates_mandatory_content(self) -> None:
+        processor = _LengthAwareProcessor()
+        sample = self.dataset[0]
+        with self.assertRaisesRegex(
+            ValueError, "image tokens, question, and assistant answer were preserved"
+        ):
+            TrainCollator(processor, max_length=4)([sample])
+
+    def test_train_collator_trims_system_only_after_rag_is_unavailable(self) -> None:
+        processor = _LengthAwareProcessor()
+        sample = {
+            "question_id": "system-overflow",
+            "image": Image.new("RGB", (4, 4)),
+            "conversation": [
+                {"role": "system", "content": "앞부분" * 20 + "필수지시"},
+                {"role": "user", "content": "<image>"},
+                {"role": "user", "content": "질문"},
+            ],
+            "answer": "답",
+        }
+
+        batch = TrainCollator(processor, max_length=10)([sample])
+
+        full_conversation = processor.collate_calls[0][0][0]["sample"]["conv"]
+        self.assertTrue(
+            sample["conversation"][0]["content"].endswith(
+                full_conversation[0]["content"]
+            )
+        )
+        self.assertEqual(full_conversation[-2]["content"], "질문")
+        self.assertEqual(full_conversation[-1]["content"], "답")
+        self.assertLessEqual(batch["input_ids"].shape[1], 10)
 
 
 if __name__ == "__main__":

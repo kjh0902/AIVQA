@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -54,6 +55,7 @@ _OUTPUT_DIRECTIVE_PATTERN = re.compile(
     r"(?:여|아|어|으)?(?:\s*주)?(?:시오|세요|라)"
 )
 _SENTENCE_BOUNDARIES = ".!?。！？\n"
+_RAG_CONTEXT_MARKER = "\n\nRAG 참고정보:\n"
 
 
 def _sentence_span(text: str, position: int) -> tuple[int, int]:
@@ -324,6 +326,168 @@ def _processor_sample(
     return {"image": [image], "conv": conversation}
 
 
+def _encoded_text_length(encoded: dict[str, Any]) -> int:
+    text_encoding = encoded.get("text")
+    if not isinstance(text_encoding, Mapping):
+        raise TypeError("Kanana encoding must contain a text encoding")
+    input_ids = text_encoding.get("input_ids")
+    if input_ids is None:
+        raise TypeError("Kanana text encoding must contain input_ids")
+    if hasattr(input_ids, "numel"):
+        return int(input_ids.numel())
+    if hasattr(input_ids, "size"):
+        return int(input_ids.size)
+    return len(input_ids)
+
+
+def _rag_context_span(
+    conversation: Sequence[dict[str, str]],
+) -> tuple[int, str, str] | None:
+    """Locate the appended RAG context without treating question text as removable."""
+    for index in range(len(conversation) - 1, -1, -1):
+        message = conversation[index]
+        if message["role"] != "user":
+            continue
+        question, marker, rag_context = message["content"].partition(
+            _RAG_CONTEXT_MARKER
+        )
+        if marker:
+            return index, question, rag_context
+    return None
+
+
+def _keep_rag_prefix(
+    conversation: Sequence[dict[str, str]],
+    rag_span: tuple[int, str, str],
+    rag_chars: int,
+) -> list[dict[str, str]]:
+    """Remove RAG characters from the back while preserving the full question."""
+    message_index, question, rag_context = rag_span
+    copied = [dict(message) for message in conversation]
+    if rag_chars > 0:
+        copied[message_index]["content"] = (
+            question + _RAG_CONTEXT_MARKER + rag_context[:rag_chars]
+        )
+    else:
+        copied[message_index]["content"] = question
+    return copied
+
+
+def _keep_system_suffix(
+    conversation: Sequence[dict[str, str]],
+    message_index: int,
+    system_prompt: str,
+    system_chars: int,
+) -> list[dict[str, str]]:
+    """Keep the most specific tail of the system instruction after RAG is gone."""
+    copied = [dict(message) for message in conversation]
+    copied[message_index]["content"] = (
+        system_prompt[-system_chars:] if system_chars > 0 else ""
+    )
+    return copied
+
+
+def _encode_training_pair(
+    processor: Any,
+    feature: dict[str, Any],
+    prompt: list[dict[str, str]],
+    answer: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    full = processor.encode(
+        _processor_sample(
+            feature,
+            prompt + [{"role": "assistant", "content": answer}],
+        ),
+        max_length=None,
+        add_generation_prompt=False,
+    )
+    prompt_only = processor.encode(
+        _processor_sample(feature, prompt),
+        max_length=None,
+        add_generation_prompt=True,
+    )
+    return full, prompt_only
+
+
+def _encode_training_feature(
+    processor: Any,
+    feature: dict[str, Any],
+    prompt: list[dict[str, str]],
+    answer: str,
+    max_length: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Encode a sample safely, trimming only the trailing RAG context if needed."""
+    full, prompt_only = _encode_training_pair(processor, feature, prompt, answer)
+    if max(_encoded_text_length(full), _encoded_text_length(prompt_only)) <= max_length:
+        return full, prompt_only
+
+    rag_span = _rag_context_span(prompt)
+    fixed_prompt = prompt
+    if rag_span is not None:
+        rag_context = rag_span[2]
+        best_pair: tuple[dict[str, Any], dict[str, Any]] | None = None
+        low = 0
+        high = len(rag_context)
+        while low <= high:
+            kept_chars = (low + high) // 2
+            candidate_prompt = _keep_rag_prefix(prompt, rag_span, kept_chars)
+            candidate_pair = _encode_training_pair(
+                processor, feature, candidate_prompt, answer
+            )
+            candidate_length = max(
+                _encoded_text_length(candidate_pair[0]),
+                _encoded_text_length(candidate_pair[1]),
+            )
+            if candidate_length <= max_length:
+                best_pair = candidate_pair
+                low = kept_chars + 1
+            else:
+                high = kept_chars - 1
+        if best_pair is not None:
+            return best_pair
+        fixed_prompt = _keep_rag_prefix(prompt, rag_span, 0)
+
+    system_index = next(
+        (
+            index
+            for index, message in enumerate(fixed_prompt)
+            if message["role"] == "system"
+        ),
+        None,
+    )
+    if system_index is not None:
+        system_prompt = fixed_prompt[system_index]["content"]
+        best_pair = None
+        low = 0
+        high = len(system_prompt)
+        while low <= high:
+            kept_chars = (low + high) // 2
+            candidate_prompt = _keep_system_suffix(
+                fixed_prompt, system_index, system_prompt, kept_chars
+            )
+            candidate_pair = _encode_training_pair(
+                processor, feature, candidate_prompt, answer
+            )
+            candidate_length = max(
+                _encoded_text_length(candidate_pair[0]),
+                _encoded_text_length(candidate_pair[1]),
+            )
+            if candidate_length <= max_length:
+                best_pair = candidate_pair
+                low = kept_chars + 1
+            else:
+                high = kept_chars - 1
+        if best_pair is not None:
+            return best_pair
+
+    question_id = feature.get("question_id", "<unknown>")
+    raise ValueError(
+        f"Training sample {question_id} exceeds --max-length after removing RAG "
+        "context and optional system text; image tokens, question, and assistant "
+        "answer were preserved. Reduce --max-pixels or increase --max-length"
+    )
+
+
 @dataclass
 class TrainCollator:
     """Build a Kanana batch with assistant-only language-model labels."""
@@ -336,8 +500,8 @@ class TrainCollator:
         if not features:
             raise ValueError("TrainCollator received an empty batch")
 
-        full_samples: list[dict[str, Any]] = []
-        prompt_samples: list[dict[str, Any]] = []
+        full_encodings: list[dict[str, Any]] = []
+        prompt_encodings: list[dict[str, Any]] = []
         for feature in features:
             prompt = _conversation(feature)
             answer = feature.get("answer")
@@ -346,28 +510,27 @@ class TrainCollator:
                 raise ValueError(
                     f"Training sample {question_id} does not contain a non-empty answer"
                 )
-            prompt_samples.append(_processor_sample(feature, prompt))
-            full_samples.append(
-                _processor_sample(
-                    feature,
-                    prompt
-                    + [{"role": "assistant", "content": str(answer).strip()}],
-                )
+            full, prompt_only = _encode_training_feature(
+                self.processor,
+                feature,
+                prompt,
+                str(answer).strip(),
+                self.max_length,
             )
+            full_encodings.append(full)
+            prompt_encodings.append(prompt_only)
 
-        batch = self.processor.batch_encode_collate(
-            full_samples,
+        batch = self.processor.collate(
+            full_encodings,
             padding="longest",
             padding_side="right",
             max_length=self.max_length,
-            add_generation_prompt=False,
         )
-        prompt_batch = self.processor.batch_encode_collate(
-            prompt_samples,
+        prompt_batch = self.processor.collate(
+            prompt_encodings,
             padding="longest",
             padding_side="right",
             max_length=self.max_length,
-            add_generation_prompt=True,
         )
 
         input_ids = batch["input_ids"]
