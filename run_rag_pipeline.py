@@ -13,7 +13,6 @@ from typing import Any
 
 from aivqa.data import KananaVQADataset, TrainCollator
 from rag_db.augmentation import (
-    CombinedVQADataset,
     RAG_CACHE_DIR,
     RagAugmentedDataset,
     generate_rag_predictions,
@@ -29,6 +28,8 @@ from train_lora import (
     MODEL_MAX_PIXELS,
     build_model_and_processor,
     create_run_output_dir,
+    evaluate_generation,
+    evaluate_loss,
     save_test_predictions,
     set_seed,
     train_one_epoch,
@@ -51,7 +52,8 @@ from type_adapters.train import (
 
 
 LOGGER = logging.getLogger("aivqa.rag_pipeline")
-SHARED_EPOCHS = 2
+SHARED_EPOCHS = 5
+SHARED_EARLY_STOPPING_PATIENCE = 2
 TYPE_EPOCHS = DEFAULT_TYPE_EPOCHS
 TYPE_EARLY_STOPPING_PATIENCE = DEFAULT_EARLY_STOPPING_PATIENCE
 ANSWER_FILENAME = "answer.json"
@@ -69,7 +71,7 @@ def resolve_repository_path(path: str | Path) -> Path:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Train a two-epoch RAG Shared LoRA, branch RAG MC/SA/LA LoRAs, "
+            "Train a validation-selected RAG Shared LoRA, branch RAG MC/SA/LA LoRAs, "
             "and create answer.json with type-best adapters and RAG."
         )
     )
@@ -92,14 +94,19 @@ def parse_args() -> argparse.Namespace:
         default=Path("outputs/kanana_1_5_v_3b_rag_pipeline"),
     )
 
-    parser.add_argument("--max-rag-chars", type=int, default=2000)
+    parser.add_argument(
+        "--max-rag-chars",
+        type=int,
+        default=1500,
+        help="Maximum description characters included per retrieved candidate",
+    )
 
     parser.add_argument("--train-batch-size", type=int, default=1)
     parser.add_argument("--eval-batch-size", type=int, default=1)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
-    parser.add_argument("--shared-learning-rate", type=float, default=5e-5)
+    parser.add_argument("--shared-learning-rate", type=float, default=3e-5)
     parser.add_argument("--type-learning-rate", type=float, default=2e-5)
-    parser.add_argument("--shared-weight-decay", type=float, default=0.01)
+    parser.add_argument("--shared-weight-decay", type=float, default=0.03)
     parser.add_argument("--type-weight-decay", type=float, default=0.03)
     parser.add_argument("--warmup-ratio", type=float, default=0.10)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
@@ -196,6 +203,9 @@ def _save_shared_adapter(
     adapter_dir: Path,
     args: argparse.Namespace,
     history: list[dict[str, Any]],
+    epoch: int,
+    best_score: float,
+    metrics: dict[str, float],
 ) -> None:
     adapter_dir.mkdir(parents=True, exist_ok=True)
     model.language_model.save_pretrained(
@@ -207,13 +217,18 @@ def _save_shared_adapter(
         adapter_dir / "training_metadata.json",
         {
             "stage": "shared",
-            "epochs": SHARED_EPOCHS,
-            "last_epoch": SHARED_EPOCHS,
-            "training_data": "train+validation",
+            "epochs": args.epochs,
+            "best_epoch": epoch,
+            "best_score": best_score,
+            "selection_metric": "final_score",
+            "metrics": metrics,
+            "training_data": "train",
             "question_forms": list(QUESTION_FORMS),
             "rag_enabled": True,
-            "validation_performed": False,
-            "best_model_selection": False,
+            "validation_data": "validation",
+            "validation_performed": True,
+            "best_model_selection": True,
+            "early_stopping_patience": args.early_stopping_patience,
             "adapter_scope": "language_model_only",
             "frozen_modules": ["vision_model", "abstractor"],
             "args": _serialized_args(args),
@@ -224,23 +239,33 @@ def _save_shared_adapter(
 
 def train_shared_adapter(
     args: argparse.Namespace,
-    dataset: RagAugmentedDataset,
+    train_dataset: RagAugmentedDataset,
+    validation_dataset: RagAugmentedDataset,
     adapter_dir: Path,
 ) -> list[dict[str, Any]]:
-    """Train exactly two epochs over train+validation and save the last adapter."""
+    """Train on train only and select the best Shared adapter on validation."""
     import torch
     from torch.utils.data import DataLoader
     from transformers import get_linear_schedule_with_warmup
 
-    model = processor = loader = optimizer = scheduler = scaler = None
+    model = processor = train_loader = validation_loader = None
+    optimizer = scheduler = scaler = None
     history: list[dict[str, Any]] = []
     try:
         set_seed(args.seed)
         model, processor, dtype = build_model_and_processor(args)
-        loader = DataLoader(
-            dataset,
+        train_loader = DataLoader(
+            train_dataset,
             batch_size=args.train_batch_size,
             shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            collate_fn=TrainCollator(processor, max_length=args.max_length),
+        )
+        validation_loader = DataLoader(
+            validation_dataset,
+            batch_size=args.eval_batch_size,
+            shuffle=False,
             num_workers=args.num_workers,
             pin_memory=True,
             collate_fn=TrainCollator(processor, max_length=args.max_length),
@@ -251,21 +276,23 @@ def train_shared_adapter(
             weight_decay=args.weight_decay,
         )
         updates_per_epoch = math.ceil(
-            len(loader) / args.gradient_accumulation_steps
+            len(train_loader) / args.gradient_accumulation_steps
         )
-        total_updates = updates_per_epoch * SHARED_EPOCHS
+        total_updates = updates_per_epoch * args.epochs
         scheduler = get_linear_schedule_with_warmup(
             optimizer,
             num_warmup_steps=int(total_updates * args.warmup_ratio),
             num_training_steps=total_updates,
         )
         scaler = torch.amp.GradScaler("cuda", enabled=args.dtype == "float16")
+        best_score = float("-inf")
+        epochs_without_improvement = 0
         started_at = time.monotonic()
-        for epoch in range(1, SHARED_EPOCHS + 1):
-            LOGGER.info("[Shared] Epoch %d/%d", epoch, SHARED_EPOCHS)
+        for epoch in range(1, args.epochs + 1):
+            LOGGER.info("[Shared] Epoch %d/%d", epoch, args.epochs)
             train_loss = train_one_epoch(
                 model,
-                loader,
+                train_loader,
                 optimizer,
                 scheduler,
                 scaler,
@@ -273,19 +300,58 @@ def train_shared_adapter(
                 args.gradient_accumulation_steps,
                 args.max_grad_norm,
             )
+            val_loss = evaluate_loss(model, validation_loader, dtype)
+            _, validation_metrics = evaluate_generation(
+                model,
+                processor,
+                validation_dataset,
+                args.eval_batch_size,
+                args.max_length,
+                args.max_new_tokens,
+                dtype,
+            )
+            score = float(validation_metrics["final_score"])
+            is_best = score > best_score
+            if is_best:
+                best_score = score
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
             record = {
                 "epoch": epoch,
                 "train_loss": float(train_loss),
+                "val_loss": float(val_loss),
                 "learning_rate": float(optimizer.param_groups[0]["lr"]),
+                **validation_metrics,
+                "selection_metric": "final_score",
+                "selection_score": score,
+                "best_score": best_score,
+                "is_best": is_best,
                 "elapsed_time": time.monotonic() - started_at,
             }
             history.append(record)
             _write_json(adapter_dir.parent / "shared_training_history.json", history)
             LOGGER.info("[Shared] %s", json.dumps(record, ensure_ascii=False))
-        _save_shared_adapter(model, adapter_dir, args, history)
+            if is_best:
+                _save_shared_adapter(
+                    model,
+                    adapter_dir,
+                    args,
+                    history,
+                    epoch,
+                    best_score,
+                    validation_metrics,
+                )
+            if epochs_without_improvement >= args.early_stopping_patience:
+                LOGGER.info(
+                    "[Shared] Early stopping after %d non-improving epoch(s).",
+                    args.early_stopping_patience,
+                )
+                break
         return history
     finally:
-        del scaler, scheduler, optimizer, loader, processor, model
+        del scaler, scheduler, optimizer, validation_loader, train_loader
+        del processor, model
         release_cuda_memory()
 
 
@@ -343,8 +409,6 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         resolve_repository_path(args.test_json),
         dataset_root=resolve_repository_path(args.dataset_root),
     )
-    train_and_validation = CombinedVQADataset([train_dataset, validation_dataset])
-
     cache_paths = rag_cache_paths(resolve_repository_path(RAG_CACHE_DIR))
     LOGGER.info("Step 1/7: loading fixed train/validation/test RAG caches")
     train_candidates = load_rag_cache(cache_paths["train"], train_dataset)
@@ -354,20 +418,36 @@ def run_pipeline(args: argparse.Namespace) -> Path:
     test_candidates = load_rag_cache(cache_paths["test"], test_dataset)
 
     set_seed(args.seed)
-    LOGGER.info("Step 2/7: Shared Adapter, train+validation, exactly 2 epochs")
-    shared_candidates = train_candidates + validation_candidates
-    shared_dataset = RagAugmentedDataset(
-        train_and_validation,
-        shared_candidates,
+    LOGGER.info(
+        "Step 2/7: Shared Adapter, train only, up to %d epochs with validation "
+        "(early-stopping patience=%d)",
+        SHARED_EPOCHS,
+        SHARED_EARLY_STOPPING_PATIENCE,
+    )
+    shared_train_dataset = RagAugmentedDataset(
+        train_dataset,
+        train_candidates,
+        max_rag_chars=args.max_rag_chars,
+    )
+    shared_validation_dataset = RagAugmentedDataset(
+        validation_dataset,
+        validation_candidates,
         max_rag_chars=args.max_rag_chars,
     )
     shared_args = copy.copy(args)
     shared_args.epochs = SHARED_EPOCHS
     shared_args.learning_rate = args.shared_learning_rate
     shared_args.weight_decay = args.shared_weight_decay
+    shared_args.early_stopping_patience = SHARED_EARLY_STOPPING_PATIENCE
     shared_adapter_dir = run_dir / "shared_adapter"
     shared_history = train_shared_adapter(
-        shared_args, shared_dataset, shared_adapter_dir
+        shared_args,
+        shared_train_dataset,
+        shared_validation_dataset,
+        shared_adapter_dir,
+    )
+    shared_best_record = max(
+        shared_history, key=lambda record: record["selection_score"]
     )
 
     rag_train = RagAugmentedDataset(
@@ -435,8 +515,14 @@ def run_pipeline(args: argparse.Namespace) -> Path:
             "search_query_model": "base_kanana",
             "shared_adapter": str(shared_adapter_dir),
             "shared_epochs": SHARED_EPOCHS,
-            "shared_training_data": "train+validation",
-            "shared_validation": False,
+            "shared_training_data": "train",
+            "shared_validation_data": "validation",
+            "shared_validation": True,
+            "shared_selection_metric": "final_score",
+            "shared_best_epoch": shared_best_record["epoch"],
+            "shared_best_score": shared_best_record["selection_score"],
+            "shared_trained_epochs": len(shared_history),
+            "shared_early_stopping_patience": SHARED_EARLY_STOPPING_PATIENCE,
             "shared_history": shared_history,
             "type_epochs": TYPE_EPOCHS,
             "type_early_stopping_patience": TYPE_EARLY_STOPPING_PATIENCE,

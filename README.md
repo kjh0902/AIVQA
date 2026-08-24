@@ -37,8 +37,9 @@ python run_rag_pipeline.py
    `rag_cache/train.json`, `validation.json`, `test.json`에 저장합니다.
 2. `run_rag_pipeline.py`는 retrieval을 수행하지 않고 세 cache를 검증·로드합니다.
    cache가 하나라도 없으면 모델을 로드하거나 학습 output을 만들기 전에 종료합니다.
-3. train+validation 전체로 Shared LoRA를 validation 없이 정확히 2 epoch 학습하고
-   마지막 checkpoint를 `shared_adapter/`에 저장합니다.
+3. train만으로 Shared LoRA를 최대 5 epoch 학습합니다. 매 epoch validation의
+   `final_score`를 평가해 best checkpoint를 `shared_adapter/`에 저장하고, 2 epoch
+   연속 개선되지 않으면 조기 종료합니다. validation은 Shared 학습에 사용하지 않습니다.
 4. 유형별 train/validation에도 cache의 RAG context를 그대로
    사용합니다.
 5. 동일한 Shared Adapter에서 MC, SA, LA를 각각 독립적으로 분기해 최대 10 epoch
@@ -77,7 +78,8 @@ python run_rag_pipeline.py
 ```
 
 RAG context는 검색 점수 상위 3개 문서에서 만들며 긴 학습 prompt를 제한하기 위해
-기본 2,000자로 자릅니다. `--max-rag-chars`로 바꿀 수 있습니다. 통합 파이프라인의
+각 문서 본문을 기본 1,500자로 자릅니다(최대 약 4,500자). `--max-rag-chars`로
+문서별 한도를 바꿀 수 있습니다. 통합 파이프라인의
 기본 이미지 상한은 약 400 visual token이며 `--max-pixels`로 바꿀 수 있습니다. 모든
 단계의 입력은 image, question, options, 검색된 RAG context로만 구성됩니다.
 

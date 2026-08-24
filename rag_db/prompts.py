@@ -77,11 +77,13 @@ def build_answer_feature(
         if str(candidate.payload.get("description", "")).strip()
     ]
     if descriptions:
-        rag_text = "\n\n---\n\n".join(descriptions)
         if max_rag_chars is not None:
             if max_rag_chars < 1:
                 raise ValueError("max_rag_chars must be positive when set")
-            rag_text = rag_text[:max_rag_chars]
+            descriptions = [
+                description[:max_rag_chars] for description in descriptions
+            ]
+        rag_text = "\n\n---\n\n".join(descriptions)
         parts.append("RAG 참고정보:\n" + rag_text)
     return {
         "conversation": [

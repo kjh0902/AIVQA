@@ -196,6 +196,18 @@ class RagPromptAndDatasetTest(unittest.TestCase):
         )
         self.assertIn("RAG 참고정보:\n가나다라", feature["conversation"][-1]["content"])
 
+    def test_answer_prompt_caps_each_rag_candidate_independently(self) -> None:
+        sample = {"question_form": "SA", "image": Image.new("RGB", (4, 4))}
+        candidates = [
+            Candidate("doc-1", _payload("doc-1", "제목1", "가나다라마바사")),
+            Candidate("doc-2", _payload("doc-2", "제목2", "아자차카타파하")),
+        ]
+        feature = build_answer_feature(
+            sample, "질문", [], candidates, max_rag_chars=4
+        )
+        content = feature["conversation"][-1]["content"]
+        self.assertIn("RAG 참고정보:\n가나다라\n\n---\n\n아자차카", content)
+
     def test_rag_dataset_preserves_answer_and_adds_context(self) -> None:
         class Dataset:
             records = [

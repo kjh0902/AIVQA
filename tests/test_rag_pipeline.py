@@ -32,6 +32,15 @@ class RagPipelineCacheTest(unittest.TestCase):
         ):
             self.assertFalse(hasattr(args, removed_option))
 
+    def test_shared_training_defaults_use_validation_selection(self) -> None:
+        with patch("sys.argv", ["run_rag_pipeline.py"]):
+            args = run_rag_pipeline.parse_args()
+        self.assertEqual(run_rag_pipeline.SHARED_EPOCHS, 5)
+        self.assertEqual(run_rag_pipeline.SHARED_EARLY_STOPPING_PATIENCE, 2)
+        self.assertEqual(args.max_rag_chars, 1500)
+        self.assertEqual(args.shared_learning_rate, 3e-5)
+        self.assertEqual(args.shared_weight_decay, 0.03)
+
     def test_missing_cache_fails_before_training(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

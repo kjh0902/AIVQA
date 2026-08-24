@@ -162,7 +162,7 @@ class RagAugmentedDataset:
         dataset: Any,
         candidates: Sequence[Sequence[Candidate]],
         *,
-        max_rag_chars: int | None = 2000,
+        max_rag_chars: int | None = 1500,
     ) -> None:
         if len(dataset) != len(candidates):
             raise ValueError(
