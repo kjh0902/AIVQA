@@ -82,8 +82,9 @@ RAG context는 검색 점수 상위 3개 문서에서 만들며 긴 학습 promp
 문서별 한도를 바꿀 수 있습니다. 통합 파이프라인의
 기본 이미지 상한은 약 400 visual token이며 `--max-pixels`로 바꿀 수 있습니다. 모든
 단계의 입력은 image, question, options, 검색된 RAG context로만 구성됩니다.
-학습 입력이 `--max-length`를 넘으면 이미지·질문·정답은 유지하고 RAG 참고정보의
-뒤쪽부터 필요한 만큼 추가로 잘라 Kanana tokenizer의 길이 assertion을 피합니다.
+학습 및 validation/test 생성 입력이 `--max-length`를 넘으면 이미지·질문과
+assistant 정답 또는 generation prompt를 유지하고, RAG 참고정보의 뒤쪽부터 필요한
+만큼 추가로 잘라 Kanana tokenizer의 길이 assertion을 피합니다.
 
 ## 환경 준비
 

@@ -32,7 +32,6 @@ if DEPENDENCIES_AVAILABLE:
         QdrantRetriever,
         normalize_exact_text,
         parse_search_terms,
-        truncate_kanana_encoding,
     )
 
 
@@ -381,40 +380,6 @@ class RagInferenceTest(unittest.TestCase):
     def test_exact_normalization_is_unicode_and_whitespace_only(self) -> None:
         self.assertEqual(normalize_exact_text("  경복궁\n 본전  "), "경복궁 본전")
         self.assertNotEqual(normalize_exact_text("경복궁"), normalize_exact_text("경복궁터"))
-
-    def test_kanana_encoding_truncation_preserves_image_and_generation_suffix(self) -> None:
-        import torch
-
-        text_encoding = {
-            "input_ids": torch.tensor([10, 11, -1, -1, 20, 21, 22, 30, 31]),
-            "attention_mask": torch.ones(9, dtype=torch.long),
-            "seq_length": 9,
-        }
-        changed = truncate_kanana_encoding(
-            text_encoding, max_length=7, generation_suffix_length=2
-        )
-
-        self.assertTrue(changed)
-        self.assertEqual(
-            text_encoding["input_ids"].tolist(), [11, -1, -1, 20, 21, 30, 31]
-        )
-        self.assertEqual(text_encoding["attention_mask"].tolist(), [1] * 7)
-        self.assertEqual(text_encoding["seq_length"], 7)
-
-    def test_kanana_encoding_below_limit_is_unchanged(self) -> None:
-        import torch
-
-        text_encoding = {
-            "input_ids": torch.tensor([10, -1, 20, 30]),
-            "attention_mask": torch.ones(4, dtype=torch.long),
-            "seq_length": 4,
-        }
-        self.assertFalse(
-            truncate_kanana_encoding(
-                text_encoding, max_length=4, generation_suffix_length=1
-            )
-        )
-        self.assertEqual(text_encoding["input_ids"].tolist(), [10, -1, 20, 30])
 
     def test_retrieval_exact_semantic_image_and_doc_id_fusion(self) -> None:
         client = _FakeQdrant()

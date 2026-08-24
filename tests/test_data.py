@@ -232,7 +232,7 @@ class DatasetTest(unittest.TestCase):
             processor_samples = (
                 [call[0] for call in processor.encode_calls[::2]]
                 if collator_type is TrainCollator
-                else processor.calls[0][0]
+                else [call[0] for call in processor.encode_calls]
             )
             collated_prompts = [
                 sample["conv"][0]["content"] for sample in processor_samples
@@ -295,14 +295,15 @@ class DatasetTest(unittest.TestCase):
     def test_generation_collator_excludes_answer_and_left_pads(self) -> None:
         processor = _FakeProcessor()
         batch = GenerationCollator(processor)([self.dataset[0]])
-        conversation = processor.calls[0][0][0]["conv"]
+        conversation = processor.encode_calls[0][0]["conv"]
         self.assertEqual(
             [message["role"] for message in conversation],
             ["system", "user", "user"],
         )
         self.assertNotIn("labels", batch)
-        self.assertTrue(processor.calls[0][1]["add_generation_prompt"])
-        self.assertEqual(processor.calls[0][1]["padding_side"], "left")
+        self.assertTrue(processor.encode_calls[0][1]["add_generation_prompt"])
+        self.assertIsNone(processor.encode_calls[0][1]["max_length"])
+        self.assertEqual(processor.collate_calls[0][1]["padding_side"], "left")
 
     def test_train_collator_rejects_missing_answer(self) -> None:
         processor = _FakeProcessor()
@@ -359,7 +360,7 @@ class DatasetTest(unittest.TestCase):
         processor = _LengthAwareProcessor()
         sample = self.dataset[0]
         with self.assertRaisesRegex(
-            ValueError, "image tokens, question, and assistant answer were preserved"
+            ValueError, "image tokens, question, and assistant answer or generation prompt"
         ):
             TrainCollator(processor, max_length=4)([sample])
 
@@ -387,6 +388,38 @@ class DatasetTest(unittest.TestCase):
         self.assertEqual(full_conversation[-2]["content"], "질문")
         self.assertEqual(full_conversation[-1]["content"], "답")
         self.assertLessEqual(batch["input_ids"].shape[1], 10)
+
+    def test_generation_collator_uses_shared_rag_truncation_policy(self) -> None:
+        processor = _LengthAwareProcessor()
+        sample = self.dataset[2]
+        original_question = sample["conversation"][-1]["content"]
+        rag_context = "검색문서" * 50
+        sample["conversation"][-1]["content"] += (
+            "\n\nRAG 참고정보:\n" + rag_context
+        )
+        mandatory_length = (
+            len(sample["conversation"][0]["content"])
+            + 2
+            + len(original_question)
+            + 1
+        )
+        max_length = mandatory_length + 25
+
+        batch = GenerationCollator(processor, max_length=max_length)([sample])
+
+        encoding = processor.collate_calls[0][0][0]
+        conversation = encoding["sample"]["conv"]
+        truncated_user = conversation[-1]["content"]
+        kept_rag = truncated_user.split("\n\nRAG 참고정보:\n", 1)[1]
+        self.assertEqual(
+            conversation[0]["content"], sample["conversation"][0]["content"]
+        )
+        self.assertTrue(truncated_user.startswith(original_question))
+        self.assertTrue(rag_context.startswith(kept_rag))
+        self.assertLess(len(kept_rag), len(rag_context))
+        self.assertTrue(processor.encode_calls[-1][1]["add_generation_prompt"])
+        self.assertLessEqual(batch["input_ids"].shape[1], max_length)
+        self.assertEqual(int((batch["input_ids"] < 0).sum()), 2)
 
 
 if __name__ == "__main__":

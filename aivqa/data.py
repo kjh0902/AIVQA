@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -409,42 +409,38 @@ def _encode_training_pair(
     return full, prompt_only
 
 
-def _encode_training_feature(
-    processor: Any,
-    feature: dict[str, Any],
+def _fit_kanana_prompt(
     prompt: list[dict[str, str]],
-    answer: str,
     max_length: int,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Encode a sample safely, trimming only the trailing RAG context if needed."""
-    full, prompt_only = _encode_training_pair(processor, feature, prompt, answer)
-    if max(_encoded_text_length(full), _encoded_text_length(prompt_only)) <= max_length:
-        return full, prompt_only
+    encode_prompt: Callable[[list[dict[str, str]]], Any],
+    encoded_length: Callable[[Any], int],
+    question_id: Any,
+    purpose: str,
+) -> Any:
+    """Fit one Kanana prompt while preserving image, question, and output suffix."""
+    encoded = encode_prompt(prompt)
+    if encoded_length(encoded) <= max_length:
+        return encoded
 
     rag_span = _rag_context_span(prompt)
     fixed_prompt = prompt
     if rag_span is not None:
         rag_context = rag_span[2]
-        best_pair: tuple[dict[str, Any], dict[str, Any]] | None = None
+        best_encoding = None
         low = 0
         high = len(rag_context)
         while low <= high:
             kept_chars = (low + high) // 2
             candidate_prompt = _keep_rag_prefix(prompt, rag_span, kept_chars)
-            candidate_pair = _encode_training_pair(
-                processor, feature, candidate_prompt, answer
-            )
-            candidate_length = max(
-                _encoded_text_length(candidate_pair[0]),
-                _encoded_text_length(candidate_pair[1]),
-            )
+            candidate_encoding = encode_prompt(candidate_prompt)
+            candidate_length = encoded_length(candidate_encoding)
             if candidate_length <= max_length:
-                best_pair = candidate_pair
+                best_encoding = candidate_encoding
                 low = kept_chars + 1
             else:
                 high = kept_chars - 1
-        if best_pair is not None:
-            return best_pair
+        if best_encoding is not None:
+            return best_encoding
         fixed_prompt = _keep_rag_prefix(prompt, rag_span, 0)
 
     system_index = next(
@@ -457,7 +453,7 @@ def _encode_training_feature(
     )
     if system_index is not None:
         system_prompt = fixed_prompt[system_index]["content"]
-        best_pair = None
+        best_encoding = None
         low = 0
         high = len(system_prompt)
         while low <= high:
@@ -465,26 +461,80 @@ def _encode_training_feature(
             candidate_prompt = _keep_system_suffix(
                 fixed_prompt, system_index, system_prompt, kept_chars
             )
-            candidate_pair = _encode_training_pair(
-                processor, feature, candidate_prompt, answer
-            )
-            candidate_length = max(
-                _encoded_text_length(candidate_pair[0]),
-                _encoded_text_length(candidate_pair[1]),
-            )
+            candidate_encoding = encode_prompt(candidate_prompt)
+            candidate_length = encoded_length(candidate_encoding)
             if candidate_length <= max_length:
-                best_pair = candidate_pair
+                best_encoding = candidate_encoding
                 low = kept_chars + 1
             else:
                 high = kept_chars - 1
-        if best_pair is not None:
-            return best_pair
+        if best_encoding is not None:
+            return best_encoding
 
-    question_id = feature.get("question_id", "<unknown>")
     raise ValueError(
-        f"Training sample {question_id} exceeds --max-length after removing RAG "
-        "context and optional system text; image tokens, question, and assistant "
-        "answer were preserved. Reduce --max-pixels or increase --max-length"
+        f"{purpose.capitalize()} sample {question_id} exceeds --max-length after "
+        "removing RAG context and optional system text; image tokens, question, "
+        "and assistant answer or generation prompt were preserved. Reduce "
+        "--max-pixels or increase --max-length"
+    )
+
+
+def _encode_training_feature(
+    processor: Any,
+    feature: dict[str, Any],
+    prompt: list[dict[str, str]],
+    answer: str,
+    max_length: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Encode a training sample with shared max-length fitting policy."""
+
+    def encode_prompt(
+        candidate_prompt: list[dict[str, str]],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        return _encode_training_pair(
+            processor, feature, candidate_prompt, answer
+        )
+
+    def encoded_length(
+        pair: tuple[dict[str, Any], dict[str, Any]],
+    ) -> int:
+        return max(
+            _encoded_text_length(pair[0]),
+            _encoded_text_length(pair[1]),
+        )
+
+    return _fit_kanana_prompt(
+        prompt,
+        max_length,
+        encode_prompt,
+        encoded_length,
+        feature.get("question_id", "<unknown>"),
+        "training",
+    )
+
+
+def encode_kanana_generation_feature(
+    processor: Any,
+    feature: dict[str, Any],
+    max_length: int,
+) -> dict[str, Any]:
+    """Encode generation input with the same fitting policy used for training."""
+    prompt = _conversation(feature)
+
+    def encode_prompt(candidate_prompt: list[dict[str, str]]) -> dict[str, Any]:
+        return processor.encode(
+            _processor_sample(feature, candidate_prompt),
+            max_length=None,
+            add_generation_prompt=True,
+        )
+
+    return _fit_kanana_prompt(
+        prompt,
+        max_length,
+        encode_prompt,
+        _encoded_text_length,
+        feature.get("question_id", "<unknown>"),
+        "generation",
     )
 
 
@@ -565,13 +615,15 @@ class GenerationCollator:
     def __call__(self, features: Sequence[dict[str, Any]]) -> dict[str, Any]:
         if not features:
             raise ValueError("GenerationCollator received an empty batch")
-        samples = [
-            _processor_sample(feature, _conversation(feature)) for feature in features
+        encodings = [
+            encode_kanana_generation_feature(
+                self.processor, feature, self.max_length
+            )
+            for feature in features
         ]
-        return self.processor.batch_encode_collate(
-            samples,
+        return self.processor.collate(
+            encodings,
             padding="longest",
             padding_side="left",
             max_length=self.max_length,
-            add_generation_prompt=True,
         )

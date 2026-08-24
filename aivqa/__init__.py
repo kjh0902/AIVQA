@@ -7,6 +7,7 @@ from .data import (
     TrainCollator,
     build_question_form_instruction,
     build_sa_instruction,
+    encode_kanana_generation_feature,
     extract_sa_constraints,
     format_question,
 )
@@ -19,6 +20,7 @@ __all__ = [
     "TrainCollator",
     "build_question_form_instruction",
     "build_sa_instruction",
+    "encode_kanana_generation_feature",
     "extract_sa_constraints",
     "format_question",
     "compute_vqa_metrics",
