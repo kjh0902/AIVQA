@@ -181,7 +181,7 @@ python train_lora.py \
 
 - MC: 선택지 번호 Accuracy
 - SA: 정규화 후 Exact Match
-- LA: ROUGE-L F1과 BLEU-4
+- LA: 문항별 ROUGE-1 F1과 BLEU-1의 평균
 - `final_score = (MC Accuracy + SA Exact Match + LA 평균) / 3`
 
 `final_score`가 개선되면 표준 PEFT adapter만 `best_adapter/`에 저장합니다. 전체

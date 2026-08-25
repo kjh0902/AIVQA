@@ -53,7 +53,7 @@ validation은 매 epoch 자동 실행됩니다. best checkpoint 선택 기준은
 
 - MC: `mc_accuracy`
 - SA: `sa_exact_match`
-- LA: `(ROUGE-L + BLEU-4) / 2`인 `descriptive_avg`
+- LA: 문항별 `(ROUGE-1 F1 + BLEU-1) / 2`인 `descriptive_avg`
 
 유형별 `training_history.json`, `training_history.csv`, `training_metadata.json`에서 결과를
 확인할 수 있습니다.

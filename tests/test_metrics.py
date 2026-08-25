@@ -42,6 +42,32 @@ class MetricsTest(unittest.TestCase):
         self.assertEqual(metrics["descriptive_avg"], 1.0)
         self.assertAlmostEqual(metrics["final_score"], 2.0 / 3.0)
 
+    def test_descriptive_metrics_reward_unigram_overlap(self) -> None:
+        metrics = compute_vqa_metrics(
+            predictions=["라 다 나 가"],
+            references=["가 나 다 라"],
+            question_forms=["LA"],
+        )
+        self.assertEqual(metrics["rouge"], 1.0)
+        self.assertEqual(metrics["bleu"], 1.0)
+        self.assertEqual(metrics["descriptive_avg"], 1.0)
+
+    def test_bleu_is_the_mean_of_sentence_level_scores(self) -> None:
+        metrics = compute_vqa_metrics(
+            predictions=["가 나 다 라", "오류"],
+            references=["가 나 다 라", "가 나 다 라"],
+            question_forms=["LA", "LA"],
+        )
+        self.assertEqual(metrics["bleu"], 0.5)
+
+    def test_bleu_applies_the_standard_brevity_penalty(self) -> None:
+        metrics = compute_vqa_metrics(
+            predictions=["가 나"],
+            references=["가 나 다 라"],
+            question_forms=["LA"],
+        )
+        self.assertAlmostEqual(metrics["bleu"], 0.36787944117144233)
+
 
 if __name__ == "__main__":
     unittest.main()
