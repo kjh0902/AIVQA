@@ -1,12 +1,24 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import sys
+import tempfile
 import unittest
-from types import SimpleNamespace
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
-from rag_db.augmentation import CombinedVQADataset, RagAugmentedDataset
+from rag_db.augmentation import (
+    CombinedVQADataset,
+    RagAugmentedDataset,
+    generate_rag_predictions,
+    load_rag_cache,
+    rag_cache_paths,
+    retrieve_dataset_candidates,
+)
 from rag_db.prompts import Candidate, build_answer_feature, build_search_feature
 
 RUNTIME_DEPENDENCIES = ("torch", "qdrant_client", "sentence_transformers", "transformers")
@@ -20,7 +32,6 @@ if DEPENDENCIES_AVAILABLE:
         QdrantRetriever,
         normalize_exact_text,
         parse_search_terms,
-        truncate_kanana_encoding,
     )
 
 
@@ -90,6 +101,70 @@ class _FakeQdrant:
 
 
 class RagPromptAndDatasetTest(unittest.TestCase):
+    def test_fixed_cache_paths_cover_all_splits(self) -> None:
+        self.assertEqual(
+            rag_cache_paths(Path("rag_cache")),
+            {
+                "train": Path("rag_cache/train.json"),
+                "validation": Path("rag_cache/validation.json"),
+                "test": Path("rag_cache/test.json"),
+            },
+        )
+
+    def test_rag_cache_loader_restores_candidates_and_checks_order(self) -> None:
+        class Dataset:
+            records = [
+                {"metadata": {"question_id": "q1"}},
+                {"metadata": {"question_id": "q2"}},
+            ]
+
+            def __len__(self):
+                return len(self.records)
+
+        rows = [
+            {
+                "question_id": "q1",
+                "search_terms": ["검색어"],
+                "candidates": [
+                    {
+                        "doc_id": "doc",
+                        "text_score": 0.9,
+                        "image_score": 0.8,
+                        "final_score": 1.7,
+                        "payload": _payload("doc", "제목"),
+                    }
+                ],
+            },
+            {"question_id": "q2", "search_terms": [], "candidates": []},
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = Path(temp_dir) / "train.json"
+            cache_path.write_text(
+                json.dumps(rows, ensure_ascii=False), encoding="utf-8"
+            )
+            candidates = load_rag_cache(cache_path, Dataset())
+            self.assertEqual(candidates[0][0].doc_id, "doc")
+            self.assertAlmostEqual(candidates[0][0].final_score, 1.7)
+            self.assertEqual(candidates[1], [])
+
+            rows[0]["question_id"] = "wrong"
+            cache_path.write_text(
+                json.dumps(rows, ensure_ascii=False), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "question_id mismatch"):
+                load_rag_cache(cache_path, Dataset())
+
+    def test_rag_cache_loader_fails_when_cache_is_missing(self) -> None:
+        class Dataset:
+            records = []
+
+            def __len__(self):
+                return 0
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaisesRegex(FileNotFoundError, "build_rag_cache.py"):
+                load_rag_cache(Path(temp_dir) / "test.json", Dataset())
+
     def test_search_prompt_uses_only_image_and_question(self) -> None:
         sample = {"image": Image.new("RGB", (4, 4))}
         feature = build_search_feature(sample, "경복궁의 건물은 무엇인가?")
@@ -99,8 +174,11 @@ class RagPromptAndDatasetTest(unittest.TestCase):
 
     def test_answer_prompt_omits_empty_rag_section(self) -> None:
         sample = {"question_form": "SA", "image": Image.new("RGB", (4, 4))}
-        no_rag = build_answer_feature(sample, "질문", [], [])
+        no_rag = build_answer_feature(sample, "4음절로 답하시오.", [], [])
         self.assertNotIn("RAG 참고정보", no_rag["conversation"][-1]["content"])
+        self.assertIn(
+            "- 요구 음절 수: 4음절", no_rag["conversation"][0]["content"]
+        )
 
         candidate = Candidate("doc", _payload("doc", "제목", "실제 설명"))
         with_rag = build_answer_feature(sample, "질문", [], [candidate])
@@ -116,6 +194,18 @@ class RagPromptAndDatasetTest(unittest.TestCase):
             sample, "질문", [], [candidate], max_rag_chars=4
         )
         self.assertIn("RAG 참고정보:\n가나다라", feature["conversation"][-1]["content"])
+
+    def test_answer_prompt_caps_each_rag_candidate_independently(self) -> None:
+        sample = {"question_form": "SA", "image": Image.new("RGB", (4, 4))}
+        candidates = [
+            Candidate("doc-1", _payload("doc-1", "제목1", "가나다라마바사")),
+            Candidate("doc-2", _payload("doc-2", "제목2", "아자차카타파하")),
+        ]
+        feature = build_answer_feature(
+            sample, "질문", [], candidates, max_rag_chars=4
+        )
+        content = feature["conversation"][-1]["content"]
+        self.assertIn("RAG 참고정보:\n가나다라\n\n---\n\n아자차카", content)
 
     def test_rag_dataset_preserves_answer_and_adds_context(self) -> None:
         class Dataset:
@@ -149,6 +239,119 @@ class RagPromptAndDatasetTest(unittest.TestCase):
         self.assertIn("RAG 참고정보:\n검색 본문", first["conversation"][-1]["content"])
         self.assertNotIn("RAG 참고정보", augmented[1]["conversation"][-1]["content"])
 
+    def test_final_rag_generation_retries_only_invalid_constrained_sa(self) -> None:
+        calls = []
+        fake_inference = ModuleType("rag_db.infer_with_rag")
+        outputs = iter(("오답", "정답값", "정답", "자유 답변"))
+
+        def generate_one(*args, **kwargs):
+            calls.append((args, kwargs))
+            return next(outputs)
+
+        fake_inference.generate_one = generate_one
+        fake_tqdm = ModuleType("tqdm")
+        fake_tqdm_auto = ModuleType("tqdm.auto")
+        fake_tqdm_auto.tqdm = lambda iterable, **kwargs: iterable
+        dataset = [
+            {
+                "question_form": "SA",
+                "question": "3음절로 답하시오.",
+                "conversation": [
+                    {"role": "user", "content": "원래 질문과 RAG 참고정보"}
+                ],
+            },
+            {
+                "question_form": "MC",
+                "question": "3음절로 답하시오.",
+                "conversation": [],
+            },
+            {
+                "question_form": "SA",
+                "question": "조건 없이 답하시오.",
+                "conversation": [],
+            },
+        ]
+        with patch.dict(
+            sys.modules,
+            {
+                "rag_db.infer_with_rag": fake_inference,
+                "tqdm": fake_tqdm,
+                "tqdm.auto": fake_tqdm_auto,
+            },
+        ):
+            predictions = generate_rag_predictions(
+                object(),
+                object(),
+                dataset,
+                max_length=32,
+                max_new_tokens=8,
+                dtype=None,
+                description="test",
+            )
+
+        self.assertEqual(predictions, ["정답값", "정답", "자유 답변"])
+        self.assertEqual(len(calls), 4)
+        self.assertTrue(all(kwargs == {} for _, kwargs in calls))
+        retry_feature = calls[1][0][2]
+        retry_prompt = retry_feature["conversation"][-1]["content"]
+        self.assertIn("원래 질문과 RAG 참고정보", retry_prompt)
+        self.assertIn("오답", retry_prompt)
+        self.assertIn("3음절", retry_prompt)
+        self.assertFalse(
+            any(
+                message["role"] == "assistant"
+                for message in retry_feature["conversation"]
+            )
+        )
+
+    def test_rag_search_generation_never_receives_length_constraint(self) -> None:
+        calls = []
+        fake_inference = ModuleType("rag_db.infer_with_rag")
+
+        def generate_one(*args, **kwargs):
+            calls.append(kwargs)
+            return '["검색어"]'
+
+        fake_inference.generate_one = generate_one
+        fake_inference.parse_search_terms = lambda value: ["검색어"]
+        fake_tqdm = ModuleType("tqdm")
+        fake_tqdm_auto = ModuleType("tqdm.auto")
+        fake_tqdm_auto.tqdm = lambda iterable, **kwargs: iterable
+
+        class Retriever:
+            @staticmethod
+            def retrieve(search_terms, image):
+                return []
+
+        dataset = [
+            {
+                "question_id": "1",
+                "question_form": "SA",
+                "question": "3음절로 답하시오.",
+                "image": Image.new("RGB", (4, 4)),
+            }
+        ]
+        with patch.dict(
+            sys.modules,
+            {
+                "rag_db.infer_with_rag": fake_inference,
+                "tqdm": fake_tqdm,
+                "tqdm.auto": fake_tqdm_auto,
+            },
+        ):
+            retrieve_dataset_candidates(
+                object(),
+                object(),
+                dataset,
+                Retriever(),
+                max_length=32,
+                search_max_new_tokens=8,
+                dtype=None,
+                description="test",
+            )
+
+        self.assertEqual(calls, [{}])
+
 
 @unittest.skipUnless(
     DEPENDENCIES_AVAILABLE,
@@ -177,40 +380,6 @@ class RagInferenceTest(unittest.TestCase):
     def test_exact_normalization_is_unicode_and_whitespace_only(self) -> None:
         self.assertEqual(normalize_exact_text("  경복궁\n 본전  "), "경복궁 본전")
         self.assertNotEqual(normalize_exact_text("경복궁"), normalize_exact_text("경복궁터"))
-
-    def test_kanana_encoding_truncation_preserves_image_and_generation_suffix(self) -> None:
-        import torch
-
-        text_encoding = {
-            "input_ids": torch.tensor([10, 11, -1, -1, 20, 21, 22, 30, 31]),
-            "attention_mask": torch.ones(9, dtype=torch.long),
-            "seq_length": 9,
-        }
-        changed = truncate_kanana_encoding(
-            text_encoding, max_length=7, generation_suffix_length=2
-        )
-
-        self.assertTrue(changed)
-        self.assertEqual(
-            text_encoding["input_ids"].tolist(), [11, -1, -1, 20, 21, 30, 31]
-        )
-        self.assertEqual(text_encoding["attention_mask"].tolist(), [1] * 7)
-        self.assertEqual(text_encoding["seq_length"], 7)
-
-    def test_kanana_encoding_below_limit_is_unchanged(self) -> None:
-        import torch
-
-        text_encoding = {
-            "input_ids": torch.tensor([10, -1, 20, 30]),
-            "attention_mask": torch.ones(4, dtype=torch.long),
-            "seq_length": 4,
-        }
-        self.assertFalse(
-            truncate_kanana_encoding(
-                text_encoding, max_length=4, generation_suffix_length=1
-            )
-        )
-        self.assertEqual(text_encoding["input_ids"].tolist(), [10, -1, 20, 30])
 
     def test_retrieval_exact_semantic_image_and_doc_id_fusion(self) -> None:
         client = _FakeQdrant()

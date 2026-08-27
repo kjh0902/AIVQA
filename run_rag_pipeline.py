@@ -1,4 +1,4 @@
-"""End-to-end Kanana-V Shared/MC/SA/LA LoRA training with RAG."""
+"""Kanana-V Shared/MC/SA/LA LoRA training with precomputed RAG caches."""
 
 from __future__ import annotations
 
@@ -8,30 +8,16 @@ import json
 import logging
 import math
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from aivqa.data import KananaVQADataset, TrainCollator
 from rag_db.augmentation import (
-    CombinedVQADataset,
+    RAG_CACHE_DIR,
     RagAugmentedDataset,
     generate_rag_predictions,
-    retrieve_dataset_candidates,
-)
-from rag_db.build_qdrant import (
-    DEFAULT_COLLECTION,
-    DEFAULT_IMAGE_MODEL,
-    DEFAULT_MODEL_CACHE,
-    DEFAULT_QDRANT_PATH,
-    DEFAULT_TEXT_MODEL,
-)
-from rag_db.infer_with_rag import (
-    QdrantRetriever,
-    RagEncoders,
-    create_qdrant_client,
-    resolve_repository_path,
-    validate_collection_schema,
+    load_rag_cache,
+    rag_cache_paths,
 )
 from train_lora import (
     DATASET_DIR,
@@ -42,40 +28,50 @@ from train_lora import (
     MODEL_MAX_PIXELS,
     build_model_and_processor,
     create_run_output_dir,
+    evaluate_generation,
+    evaluate_loss,
     save_test_predictions,
     set_seed,
     train_one_epoch,
 )
-from type_adapters.data import QUESTION_FORMS, build_type_subsets, restore_original_order
+from type_adapters.data import (
+    QUESTION_FORMS,
+    build_type_subsets,
+    restore_original_order,
+)
 from type_adapters.modeling import (
     attach_type_adapters_for_inference,
     load_base_model_and_processor,
     release_cuda_memory,
 )
-from type_adapters.train import train_question_form
+from type_adapters.train import (
+    DEFAULT_EARLY_STOPPING_PATIENCE,
+    DEFAULT_TYPE_EPOCHS,
+    train_question_form,
+)
 
 
 LOGGER = logging.getLogger("aivqa.rag_pipeline")
-SHARED_EPOCHS = 2
-TYPE_EPOCHS = 3
+SHARED_EPOCHS = 5
+SHARED_EARLY_STOPPING_PATIENCE = 2
+TYPE_EPOCHS = DEFAULT_TYPE_EPOCHS
+TYPE_EARLY_STOPPING_PATIENCE = DEFAULT_EARLY_STOPPING_PATIENCE
 ANSWER_FILENAME = "answer.json"
 PIPELINE_DEFAULT_MAX_PIXELS = 400 * IMAGE_COMPRESSION_FACTOR**2
+REPOSITORY_ROOT = Path(__file__).resolve().parent
 
 
-@dataclass
-class RagResources:
-    encoders: RagEncoders
-    client: Any
-    retriever: QdrantRetriever
-
-    def close(self) -> None:
-        self.client.close()
+def resolve_repository_path(path: str | Path) -> Path:
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = REPOSITORY_ROOT / candidate
+    return candidate.resolve()
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Train a two-epoch RAG Shared LoRA, branch RAG MC/SA/LA LoRAs, "
+            "Train a validation-selected RAG Shared LoRA, branch RAG MC/SA/LA LoRAs, "
             "and create answer.json with type-best adapters and RAG."
         )
     )
@@ -98,28 +94,19 @@ def parse_args() -> argparse.Namespace:
         default=Path("outputs/kanana_1_5_v_3b_rag_pipeline"),
     )
 
-    qdrant_group = parser.add_mutually_exclusive_group()
-    qdrant_group.add_argument("--qdrant-path", type=Path, default=DEFAULT_QDRANT_PATH)
-    qdrant_group.add_argument("--qdrant-url")
-    parser.add_argument("--collection", default=DEFAULT_COLLECTION)
-    parser.add_argument("--model-cache", type=Path, default=DEFAULT_MODEL_CACHE)
-    parser.add_argument("--score-threshold", type=float, default=0.9)
-    parser.add_argument("--retrieval-page-size", type=int, default=100)
     parser.add_argument(
-        "--rag-device",
-        default="cpu",
-        help="RAG encoder device; CPU is the default to preserve training VRAM",
+        "--max-rag-chars",
+        type=int,
+        default=1500,
+        help="Maximum description characters included per retrieved candidate",
     )
-    parser.add_argument("--rag-fp32", action="store_true")
-    parser.add_argument("--max-rag-chars", type=int, default=2000)
-    parser.add_argument("--search-max-new-tokens", type=int, default=128)
 
     parser.add_argument("--train-batch-size", type=int, default=1)
     parser.add_argument("--eval-batch-size", type=int, default=1)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
-    parser.add_argument("--shared-learning-rate", type=float, default=5e-5)
+    parser.add_argument("--shared-learning-rate", type=float, default=3e-5)
     parser.add_argument("--type-learning-rate", type=float, default=2e-5)
-    parser.add_argument("--shared-weight-decay", type=float, default=0.01)
+    parser.add_argument("--shared-weight-decay", type=float, default=0.03)
     parser.add_argument("--type-weight-decay", type=float, default=0.03)
     parser.add_argument("--warmup-ratio", type=float, default=0.10)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
@@ -151,33 +138,34 @@ def parse_args() -> argparse.Namespace:
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    for split, cache_path in rag_cache_paths(
+        resolve_repository_path(RAG_CACHE_DIR)
+    ).items():
+        if not cache_path.is_file():
+            raise FileNotFoundError(
+                f"Required {split} RAG cache does not exist: {cache_path}. "
+                "Run `python build_rag_cache.py` first."
+            )
     for label, path in (
         ("train JSON", args.train_json),
         ("validation JSON", args.validation_json),
         ("test JSON", args.test_json),
     ):
-        if not resolve_repository_path(path).is_file():
-            raise FileNotFoundError(f"{label} does not exist: {resolve_repository_path(path)}")
-    if not args.qdrant_url and not resolve_repository_path(args.qdrant_path).is_dir():
-        raise FileNotFoundError(
-            f"Qdrant storage does not exist: {resolve_repository_path(args.qdrant_path)}"
-        )
+        resolved = resolve_repository_path(path)
+        if not resolved.is_file():
+            raise FileNotFoundError(f"{label} does not exist: {resolved}")
     for field in (
         "train_batch_size",
         "eval_batch_size",
         "gradient_accumulation_steps",
         "max_length",
         "max_new_tokens",
-        "search_max_new_tokens",
-        "retrieval_page_size",
         "max_rag_chars",
         "lora_r",
         "lora_alpha",
     ):
         if getattr(args, field) < 1:
             raise ValueError(f"--{field.replace('_', '-')} must be at least 1")
-    if not 0.0 <= args.score_threshold <= 1.0:
-        raise ValueError("--score-threshold must be between 0 and 1")
     if not 0.0 <= args.warmup_ratio < 1.0:
         raise ValueError("--warmup-ratio must be in [0, 1)")
     if not 0.0 <= args.lora_dropout < 1.0:
@@ -210,44 +198,14 @@ def _write_json(path: Path, payload: Any) -> None:
     temporary_path.replace(path)
 
 
-def load_rag_resources(args: argparse.Namespace) -> RagResources:
-    """Load and validate the shared RAG resources before any Kanana training."""
-    model_cache = resolve_repository_path(args.model_cache)
-    qdrant_path = None if args.qdrant_url else resolve_repository_path(args.qdrant_path)
-    encoders = RagEncoders(
-        DEFAULT_TEXT_MODEL,
-        DEFAULT_IMAGE_MODEL,
-        model_cache,
-        args.rag_device,
-        args.rag_fp32,
-    )
-    client = create_qdrant_client(qdrant_path, args.qdrant_url)
-    try:
-        validate_collection_schema(
-            client,
-            args.collection,
-            encoders.text_dimension,
-            encoders.image_dimension,
-        )
-        retriever = QdrantRetriever(
-            client,
-            args.collection,
-            encoders,
-            args.score_threshold,
-            args.retrieval_page_size,
-            local_image_search=qdrant_path is not None,
-        )
-    except Exception:
-        client.close()
-        raise
-    return RagResources(encoders=encoders, client=client, retriever=retriever)
-
-
 def _save_shared_adapter(
     model: Any,
     adapter_dir: Path,
     args: argparse.Namespace,
     history: list[dict[str, Any]],
+    epoch: int,
+    best_score: float,
+    metrics: dict[str, float],
 ) -> None:
     adapter_dir.mkdir(parents=True, exist_ok=True)
     model.language_model.save_pretrained(
@@ -259,13 +217,18 @@ def _save_shared_adapter(
         adapter_dir / "training_metadata.json",
         {
             "stage": "shared",
-            "epochs": SHARED_EPOCHS,
-            "last_epoch": SHARED_EPOCHS,
-            "training_data": "train+validation",
+            "epochs": args.epochs,
+            "best_epoch": epoch,
+            "best_score": best_score,
+            "selection_metric": "final_score",
+            "metrics": metrics,
+            "training_data": "train",
             "question_forms": list(QUESTION_FORMS),
             "rag_enabled": True,
-            "validation_performed": False,
-            "best_model_selection": False,
+            "validation_data": "validation",
+            "validation_performed": True,
+            "best_model_selection": True,
+            "early_stopping_patience": args.early_stopping_patience,
             "adapter_scope": "language_model_only",
             "frozen_modules": ["vision_model", "abstractor"],
             "args": _serialized_args(args),
@@ -276,23 +239,33 @@ def _save_shared_adapter(
 
 def train_shared_adapter(
     args: argparse.Namespace,
-    dataset: RagAugmentedDataset,
+    train_dataset: RagAugmentedDataset,
+    validation_dataset: RagAugmentedDataset,
     adapter_dir: Path,
 ) -> list[dict[str, Any]]:
-    """Train exactly two epochs over train+validation and save the last adapter."""
+    """Train on train only and select the best Shared adapter on validation."""
     import torch
     from torch.utils.data import DataLoader
     from transformers import get_linear_schedule_with_warmup
 
-    model = processor = loader = optimizer = scheduler = scaler = None
+    model = processor = train_loader = validation_loader = None
+    optimizer = scheduler = scaler = None
     history: list[dict[str, Any]] = []
     try:
         set_seed(args.seed)
         model, processor, dtype = build_model_and_processor(args)
-        loader = DataLoader(
-            dataset,
+        train_loader = DataLoader(
+            train_dataset,
             batch_size=args.train_batch_size,
             shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            collate_fn=TrainCollator(processor, max_length=args.max_length),
+        )
+        validation_loader = DataLoader(
+            validation_dataset,
+            batch_size=args.eval_batch_size,
+            shuffle=False,
             num_workers=args.num_workers,
             pin_memory=True,
             collate_fn=TrainCollator(processor, max_length=args.max_length),
@@ -303,21 +276,23 @@ def train_shared_adapter(
             weight_decay=args.weight_decay,
         )
         updates_per_epoch = math.ceil(
-            len(loader) / args.gradient_accumulation_steps
+            len(train_loader) / args.gradient_accumulation_steps
         )
-        total_updates = updates_per_epoch * SHARED_EPOCHS
+        total_updates = updates_per_epoch * args.epochs
         scheduler = get_linear_schedule_with_warmup(
             optimizer,
             num_warmup_steps=int(total_updates * args.warmup_ratio),
             num_training_steps=total_updates,
         )
         scaler = torch.amp.GradScaler("cuda", enabled=args.dtype == "float16")
+        best_score = float("-inf")
+        epochs_without_improvement = 0
         started_at = time.monotonic()
-        for epoch in range(1, SHARED_EPOCHS + 1):
-            LOGGER.info("[Shared] Epoch %d/%d", epoch, SHARED_EPOCHS)
+        for epoch in range(1, args.epochs + 1):
+            LOGGER.info("[Shared] Epoch %d/%d", epoch, args.epochs)
             train_loss = train_one_epoch(
                 model,
-                loader,
+                train_loader,
                 optimizer,
                 scheduler,
                 scaler,
@@ -325,43 +300,57 @@ def train_shared_adapter(
                 args.gradient_accumulation_steps,
                 args.max_grad_norm,
             )
+            val_loss = evaluate_loss(model, validation_loader, dtype)
+            _, validation_metrics = evaluate_generation(
+                model,
+                processor,
+                validation_dataset,
+                args.eval_batch_size,
+                args.max_length,
+                args.max_new_tokens,
+                dtype,
+            )
+            score = float(validation_metrics["final_score"])
+            is_best = score > best_score
+            if is_best:
+                best_score = score
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
             record = {
                 "epoch": epoch,
                 "train_loss": float(train_loss),
+                "val_loss": float(val_loss),
                 "learning_rate": float(optimizer.param_groups[0]["lr"]),
+                **validation_metrics,
+                "selection_metric": "final_score",
+                "selection_score": score,
+                "best_score": best_score,
+                "is_best": is_best,
                 "elapsed_time": time.monotonic() - started_at,
             }
             history.append(record)
             _write_json(adapter_dir.parent / "shared_training_history.json", history)
             LOGGER.info("[Shared] %s", json.dumps(record, ensure_ascii=False))
-        _save_shared_adapter(model, adapter_dir, args, history)
+            if is_best:
+                _save_shared_adapter(
+                    model,
+                    adapter_dir,
+                    args,
+                    history,
+                    epoch,
+                    best_score,
+                    validation_metrics,
+                )
+            if epochs_without_improvement >= args.early_stopping_patience:
+                LOGGER.info(
+                    "[Shared] Early stopping after %d non-improving epoch(s).",
+                    args.early_stopping_patience,
+                )
+                break
         return history
     finally:
-        del scaler, scheduler, optimizer, loader, processor, model
-        release_cuda_memory()
-
-
-def _retrieve_with_base(
-    args: argparse.Namespace,
-    dataset: Any,
-    retriever: QdrantRetriever,
-    cache_path: Path,
-) -> list[list[Any]]:
-    model = processor = None
-    try:
-        model, processor, dtype = load_base_model_and_processor(args, for_training=False)
-        return retrieve_dataset_candidates(
-            model,
-            processor,
-            dataset,
-            retriever,
-            max_length=args.max_length,
-            search_max_new_tokens=args.search_max_new_tokens,
-            dtype=dtype,
-            description="Shared RAG retrieval (Base Kanana)",
-            cache_path=cache_path,
-        )
-    finally:
+        del scaler, scheduler, optimizer, validation_loader, train_loader
         del processor, model
         release_cuda_memory()
 
@@ -370,27 +359,14 @@ def run_test_inference(
     args: argparse.Namespace,
     test_dataset: KananaVQADataset,
     adapter_dirs: dict[str, Path],
-    retriever: QdrantRetriever,
-    cache_dir: Path,
+    test_candidates: list[list[Any]],
 ) -> list[str]:
     model = processor = None
     try:
-        model, processor, dtype = load_base_model_and_processor(args, for_training=False)
+        model, processor, dtype = load_base_model_and_processor(
+            args, for_training=False
+        )
         subsets = build_type_subsets(test_dataset)
-        candidates_by_form: dict[str, list[list[Any]]] = {}
-        for question_form in QUESTION_FORMS:
-            candidates_by_form[question_form] = retrieve_dataset_candidates(
-                model,
-                processor,
-                subsets[question_form],
-                retriever,
-                max_length=args.max_length,
-                search_max_new_tokens=args.search_max_new_tokens,
-                dtype=dtype,
-                description=f"{question_form} test RAG retrieval (Base Kanana)",
-                cache_path=cache_dir / f"test_{question_form.lower()}.json",
-            )
-
         model = attach_type_adapters_for_inference(model, adapter_dirs)
         grouped_predictions: dict[str, list[str]] = {}
         for question_form in QUESTION_FORMS:
@@ -398,7 +374,7 @@ def run_test_inference(
             model.eval()
             rag_subset = RagAugmentedDataset(
                 subsets[question_form],
-                candidates_by_form[question_form],
+                [test_candidates[index] for index in subsets[question_form].indices],
                 max_rag_chars=args.max_rag_chars,
             )
             grouped_predictions[question_form] = generate_rag_predictions(
@@ -419,7 +395,6 @@ def run_test_inference(
 def run_pipeline(args: argparse.Namespace) -> Path:
     validate_args(args)
     run_dir = create_run_output_dir(resolve_repository_path(args.output_dir))
-    cache_dir = run_dir / "rag_cache"
     LOGGER.info("Pipeline output: %s", run_dir)
 
     train_dataset = KananaVQADataset(
@@ -434,112 +409,132 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         resolve_repository_path(args.test_json),
         dataset_root=resolve_repository_path(args.dataset_root),
     )
-    train_and_validation = CombinedVQADataset([train_dataset, validation_dataset])
+    cache_paths = rag_cache_paths(resolve_repository_path(RAG_CACHE_DIR))
+    LOGGER.info("Step 1/7: loading fixed train/validation/test RAG caches")
+    train_candidates = load_rag_cache(cache_paths["train"], train_dataset)
+    validation_candidates = load_rag_cache(
+        cache_paths["validation"], validation_dataset
+    )
+    test_candidates = load_rag_cache(cache_paths["test"], test_dataset)
 
-    LOGGER.info("Step 1/7: loading RAG encoders and Qdrant")
-    rag = load_rag_resources(args)
-    try:
-        set_seed(args.seed)
-        LOGGER.info("Step 2/7: Shared Adapter, train+validation, exactly 2 epochs")
-        shared_candidates = _retrieve_with_base(
-            args,
-            train_and_validation,
-            rag.retriever,
-            cache_dir / "shared_train_validation.json",
-        )
-        shared_dataset = RagAugmentedDataset(
-            train_and_validation,
-            shared_candidates,
-            max_rag_chars=args.max_rag_chars,
-        )
-        shared_args = copy.copy(args)
-        shared_args.epochs = SHARED_EPOCHS
-        shared_args.learning_rate = args.shared_learning_rate
-        shared_args.weight_decay = args.shared_weight_decay
-        shared_adapter_dir = run_dir / "shared_adapter"
-        shared_history = train_shared_adapter(
-            shared_args, shared_dataset, shared_adapter_dir
-        )
+    set_seed(args.seed)
+    LOGGER.info(
+        "Step 2/7: Shared Adapter, train only, up to %d epochs with validation "
+        "(early-stopping patience=%d)",
+        SHARED_EPOCHS,
+        SHARED_EARLY_STOPPING_PATIENCE,
+    )
+    shared_train_dataset = RagAugmentedDataset(
+        train_dataset,
+        train_candidates,
+        max_rag_chars=args.max_rag_chars,
+    )
+    shared_validation_dataset = RagAugmentedDataset(
+        validation_dataset,
+        validation_candidates,
+        max_rag_chars=args.max_rag_chars,
+    )
+    shared_args = copy.copy(args)
+    shared_args.epochs = SHARED_EPOCHS
+    shared_args.learning_rate = args.shared_learning_rate
+    shared_args.weight_decay = args.shared_weight_decay
+    shared_args.early_stopping_patience = SHARED_EARLY_STOPPING_PATIENCE
+    shared_adapter_dir = run_dir / "shared_adapter"
+    shared_history = train_shared_adapter(
+        shared_args,
+        shared_train_dataset,
+        shared_validation_dataset,
+        shared_adapter_dir,
+    )
+    shared_best_record = max(
+        shared_history, key=lambda record: record["selection_score"]
+    )
 
-        # Search-query generation is always owned by the pretrained Base Kanana.
-        # Reuse its candidates for every downstream adapter branch instead of
-        # allowing the newly trained Shared Adapter to alter retrieval inputs.
-        all_type_candidates = shared_candidates
-        train_count = len(train_dataset)
-        rag_train = RagAugmentedDataset(
-            train_dataset,
-            all_type_candidates[:train_count],
-            max_rag_chars=args.max_rag_chars,
-        )
-        rag_validation = RagAugmentedDataset(
-            validation_dataset,
-            all_type_candidates[train_count:],
-            max_rag_chars=args.max_rag_chars,
-        )
-        train_subsets = build_type_subsets(rag_train)
-        validation_subsets = build_type_subsets(rag_validation)
+    rag_train = RagAugmentedDataset(
+        train_dataset,
+        train_candidates,
+        max_rag_chars=args.max_rag_chars,
+    )
+    rag_validation = RagAugmentedDataset(
+        validation_dataset,
+        validation_candidates,
+        max_rag_chars=args.max_rag_chars,
+    )
+    train_subsets = build_type_subsets(rag_train)
+    validation_subsets = build_type_subsets(rag_validation)
 
-        type_args = copy.copy(args)
-        type_args.shared_adapter_dir = shared_adapter_dir
-        type_args.epochs = TYPE_EPOCHS
-        type_args.learning_rate = args.type_learning_rate
-        type_args.weight_decay = args.type_weight_decay
-        type_args.early_stopping_patience = TYPE_EPOCHS
-        adapter_dirs: dict[str, Path] = {}
-        type_results: list[dict[str, Any]] = []
-        for step, question_form in enumerate(QUESTION_FORMS, start=3):
-            LOGGER.info(
-                "Step %d/7: %s branch, exactly 3 epochs with RAG validation",
-                step,
-                question_form,
-            )
-            adapter_dir = run_dir / f"{question_form.lower()}_adapter"
-            result = train_question_form(
-                type_args,
-                question_form,
-                train_subsets[question_form],
-                validation_subsets[question_form],
-                adapter_dir,
-            )
-            adapter_dirs[question_form] = adapter_dir
-            type_results.append(result)
-            _write_json(run_dir / "type_training_summary.json", type_results)
+    type_args = copy.copy(args)
+    type_args.shared_adapter_dir = shared_adapter_dir
+    type_args.epochs = TYPE_EPOCHS
+    type_args.learning_rate = args.type_learning_rate
+    type_args.weight_decay = args.type_weight_decay
+    type_args.early_stopping_patience = TYPE_EARLY_STOPPING_PATIENCE
+    adapter_dirs: dict[str, Path] = {}
+    type_results: list[dict[str, Any]] = []
+    for step, question_form in enumerate(QUESTION_FORMS, start=3):
+        LOGGER.info(
+            "Step %d/7: %s branch, up to %d epochs with RAG validation "
+            "(early-stopping patience=%d)",
+            step,
+            question_form,
+            TYPE_EPOCHS,
+            TYPE_EARLY_STOPPING_PATIENCE,
+        )
+        adapter_dir = run_dir / f"{question_form.lower()}_adapter"
+        result = train_question_form(
+            type_args,
+            question_form,
+            train_subsets[question_form],
+            validation_subsets[question_form],
+            adapter_dir,
+        )
+        adapter_dirs[question_form] = adapter_dir
+        type_results.append(result)
+        _write_json(run_dir / "type_training_summary.json", type_results)
 
-        LOGGER.info("Step 6/7: type-best Adapter + RAG test inference")
-        predictions = run_test_inference(
-            args,
-            test_dataset,
-            adapter_dirs,
-            rag.retriever,
-            cache_dir,
-        )
-        answer_path = run_dir / ANSWER_FILENAME
-        LOGGER.info("Step 7/7: saving submission JSON to %s", answer_path)
-        save_test_predictions(
-            resolve_repository_path(args.test_json), predictions, answer_path
-        )
-        _write_json(
-            run_dir / "pipeline_summary.json",
-            {
-                "rag_enabled": True,
-                "search_query_model": "base_kanana",
-                "shared_adapter": str(shared_adapter_dir),
-                "shared_epochs": SHARED_EPOCHS,
-                "shared_training_data": "train+validation",
-                "shared_validation": False,
-                "shared_history": shared_history,
-                "type_epochs": TYPE_EPOCHS,
-                "type_adapters": {
-                    key: str(value) for key, value in adapter_dirs.items()
-                },
-                "type_results": type_results,
-                "answer_json": str(answer_path),
-                "args": _serialized_args(args),
+    LOGGER.info("Step 6/7: type-best Adapter + cached-RAG test inference")
+    predictions = run_test_inference(
+        args,
+        test_dataset,
+        adapter_dirs,
+        test_candidates,
+    )
+    answer_path = run_dir / ANSWER_FILENAME
+    LOGGER.info("Step 7/7: saving submission JSON to %s", answer_path)
+    save_test_predictions(
+        resolve_repository_path(args.test_json), predictions, answer_path
+    )
+    _write_json(
+        run_dir / "pipeline_summary.json",
+        {
+            "rag_enabled": True,
+            "rag_retrieval_performed": False,
+            "rag_cache": {
+                split: str(path) for split, path in cache_paths.items()
             },
-        )
-        return answer_path
-    finally:
-        rag.close()
+            "search_query_model": "base_kanana",
+            "shared_adapter": str(shared_adapter_dir),
+            "shared_epochs": SHARED_EPOCHS,
+            "shared_training_data": "train",
+            "shared_validation_data": "validation",
+            "shared_validation": True,
+            "shared_selection_metric": "final_score",
+            "shared_best_epoch": shared_best_record["epoch"],
+            "shared_best_score": shared_best_record["selection_score"],
+            "shared_trained_epochs": len(shared_history),
+            "shared_early_stopping_patience": SHARED_EARLY_STOPPING_PATIENCE,
+            "shared_history": shared_history,
+            "type_epochs": TYPE_EPOCHS,
+            "type_early_stopping_patience": TYPE_EARLY_STOPPING_PATIENCE,
+            "type_adapters": {
+                key: str(value) for key, value in adapter_dirs.items()
+            },
+            "type_results": type_results,
+            "answer_json": str(answer_path),
+            "args": _serialized_args(args),
+        },
+    )
+    return answer_path
 
 
 def main() -> int:

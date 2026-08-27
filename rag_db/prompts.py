@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from typing import Any, Sequence
 
 from aivqa.data import (
-    QUESTION_FORM_INSTRUCTIONS,
     SYSTEM_PROMPT,
+    build_question_form_instruction,
     format_question,
 )
 
@@ -66,7 +66,8 @@ def build_answer_feature(
 ) -> dict[str, Any]:
     question_form = sample["question_form"]
     system_prompt = (
-        f"{SYSTEM_PROMPT}\n\n{QUESTION_FORM_INSTRUCTIONS[question_form]}\n\n"
+        f"{SYSTEM_PROMPT}\n\n"
+        f"{build_question_form_instruction(question_form, question)}\n\n"
         f"{REFERENCE_CAUTION}"
     )
     parts = [format_question(question_form, question, options)]
@@ -76,11 +77,13 @@ def build_answer_feature(
         if str(candidate.payload.get("description", "")).strip()
     ]
     if descriptions:
-        rag_text = "\n\n---\n\n".join(descriptions)
         if max_rag_chars is not None:
             if max_rag_chars < 1:
                 raise ValueError("max_rag_chars must be positive when set")
-            rag_text = rag_text[:max_rag_chars]
+            descriptions = [
+                description[:max_rag_chars] for description in descriptions
+            ]
+        rag_text = "\n\n---\n\n".join(descriptions)
         parts.append("RAG 참고정보:\n" + rag_text)
     return {
         "conversation": [

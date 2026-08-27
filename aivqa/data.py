@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import re
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -27,14 +29,118 @@ QUESTION_FORM_INSTRUCTIONS = {
         "'/'로 구분하세요. 설명이나 다른 문장은 출력하지 마세요."
     ),
     "SA": (
-        "질문에서 요구한 음절 수, 어절 수, 답의 개수를 정확히 지키고 정답만 "
-        "간결하게 출력하세요. 설명이나 부가 문장은 출력하지 마세요."
+        "질문에 명시된 출력 조건을 모두 지키고 정답만 출력하세요. "
+        "설명이나 부가 문장은 출력하지 마세요."
     ),
     "LA": (
         "250자 이내의 한 문단으로 답하세요. 같은 내용을 반복하지 말고, 이미지와 "
         "질문에 필요한 내용만 구체적으로 서술하세요."
     ),
 }
+
+_KOREAN_COUNT_WORDS = "한|두|세|네|다섯|여섯|일곱|여덟|아홉|열"
+SA_CONSTRAINT_PATTERN = re.compile(
+    rf"(?<![\d.가-힣])(?P<count>\d+|{_KOREAN_COUNT_WORDS})"
+    r"\s*(?P<unit>음절|어절|가지|개|답)"
+)
+SA_CONSTRAINT_LABELS = {
+    "음절": "음절 수",
+    "어절": "어절 수",
+    "개": "답변 개수",
+    "가지": "답변 개수",
+    "답": "답 수",
+}
+_OUTPUT_DIRECTIVE_PATTERN = re.compile(
+    r"(?:답하|작성하|제시하|나열하|열거하|말하|쓰|적|고르|찾)"
+    r"(?:여|아|어|으)?(?:\s*주)?(?:시오|세요|라)"
+)
+_SENTENCE_BOUNDARIES = ".!?。！？\n"
+_RAG_CONTEXT_MARKER = "\n\nRAG 참고정보:\n"
+
+
+def _sentence_span(text: str, position: int) -> tuple[int, int]:
+    start = max(text.rfind(boundary, 0, position) for boundary in _SENTENCE_BOUNDARIES)
+    ends = [text.find(boundary, position) for boundary in _SENTENCE_BOUNDARIES]
+    valid_ends = [end for end in ends if end >= 0]
+    return start + 1, min(valid_ends, default=len(text))
+
+
+def _is_answer_count_constraint(question: str, match: re.Match[str]) -> bool:
+    """Reject object counts unless they are grammatically tied to an answer command."""
+    sentence_start, sentence_end = _sentence_span(question, match.start())
+    sentence = question[sentence_start:sentence_end]
+    relative_end = match.end() - sentence_start
+    tail = sentence[relative_end:].lstrip()
+
+    if match.group("unit") == "답" and re.match(r"^하(?:시오|세요|라)", tail):
+        return True
+
+    directive = _OUTPUT_DIRECTIVE_PATTERN.search(tail)
+    if directive is None:
+        return False
+
+    before_directive = tail[: directive.start()].strip(" ,()")
+    if not before_directive:
+        return True
+    if before_directive.startswith(("를", "을", "만", "씩", "로")):
+        return True
+    # Handles forms such as "3가지 이유를 답하시오" while excluding factual
+    # descriptions such as "4개의 그릇은 ... 답하시오".
+    return bool(re.fullmatch(r"[가-힣]{1,12}(?:을|를)", before_directive))
+
+
+def extract_sa_constraints(question: str) -> list[tuple[str, str]]:
+    """Extract explicit SA output constraints in their order of appearance."""
+    constraints: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for match in SA_CONSTRAINT_PATTERN.finditer(question):
+        unit = match.group("unit")
+        if unit in {"개", "가지", "답"} and not _is_answer_count_constraint(
+            question, match
+        ):
+            continue
+        count = match.group("count")
+        value = f"{count}{unit}" if count.isdigit() else f"{count} {unit}"
+        constraint = (SA_CONSTRAINT_LABELS[unit], value)
+        if constraint not in seen:
+            constraints.append(constraint)
+            seen.add(constraint)
+    return constraints
+
+
+def build_sa_instruction(question: str) -> str:
+    """Build a per-sample SA instruction containing parsed output constraints."""
+    constraints = extract_sa_constraints(question)
+    lines = [
+        "이 문제는 단답형입니다.",
+        "",
+        "반드시 질문에서 요구하는 출력 조건을 먼저 확인한 뒤 답하세요.",
+    ]
+    if constraints:
+        lines.extend(f"- 요구 {label}: {value}" for label, value in constraints)
+        lines.append("- 최종 답변이 위 조건을 만족하는지 확인한 뒤 출력하세요.")
+    else:
+        lines.append("- 질문에 별도의 출력 조건이 있다면 모두 준수하세요.")
+    lines.extend(
+        [
+            "",
+            "조건을 만족하는 정답만 출력하세요. 설명이나 부가 문장은 출력하지 마세요.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def build_question_form_instruction(question_form: str, question: str) -> str:
+    """Return the form instruction, including per-question SA constraints."""
+    normalized_form = str(question_form).strip().upper()
+    if normalized_form not in QUESTION_FORM_INSTRUCTIONS:
+        allowed = ", ".join(QUESTION_FORM_INSTRUCTIONS)
+        raise ValueError(
+            f"Unsupported question_form {question_form!r}; expected one of: {allowed}"
+        )
+    if normalized_form == "SA":
+        return build_sa_instruction(question)
+    return QUESTION_FORM_INSTRUCTIONS[normalized_form]
 
 
 def format_question(question_form: str, question: str, options: Sequence[str]) -> str:
@@ -100,8 +206,8 @@ class KananaVQADataset:
         model_input = self._require_mapping(record, "model_input", index)
 
         question_form = self._require_text(metadata, "question_form", index).upper()
-        if question_form not in QUESTION_FORM_INSTRUCTIONS:
-            allowed = ", ".join(QUESTION_FORM_INSTRUCTIONS)
+        if question_form not in QUESTION_FORM_LABELS:
+            allowed = ", ".join(QUESTION_FORM_LABELS)
             raise ValueError(
                 f"Sample {index}: unsupported question_form {question_form!r}; "
                 f"expected one of: {allowed}"
@@ -119,9 +225,8 @@ class KananaVQADataset:
         image = self._load_rgb_image(image_path, index)
 
         formatted_question = format_question(question_form, question, options)
-        instruction_prompt = (
-            f"{self.system_prompt}\n\n{QUESTION_FORM_INSTRUCTIONS[question_form]}"
-        )
+        form_instruction = build_question_form_instruction(question_form, question)
+        instruction_prompt = f"{self.system_prompt}\n\n{form_instruction}"
         # This follows the model card's native input format: images are passed
         # separately and each image is represented by one <image> marker in conv.
         conversation = [
@@ -221,6 +326,218 @@ def _processor_sample(
     return {"image": [image], "conv": conversation}
 
 
+def _encoded_text_length(encoded: dict[str, Any]) -> int:
+    text_encoding = encoded.get("text")
+    if not isinstance(text_encoding, Mapping):
+        raise TypeError("Kanana encoding must contain a text encoding")
+    input_ids = text_encoding.get("input_ids")
+    if input_ids is None:
+        raise TypeError("Kanana text encoding must contain input_ids")
+    if hasattr(input_ids, "numel"):
+        return int(input_ids.numel())
+    if hasattr(input_ids, "size"):
+        return int(input_ids.size)
+    return len(input_ids)
+
+
+def _rag_context_span(
+    conversation: Sequence[dict[str, str]],
+) -> tuple[int, str, str] | None:
+    """Locate the appended RAG context without treating question text as removable."""
+    for index in range(len(conversation) - 1, -1, -1):
+        message = conversation[index]
+        if message["role"] != "user":
+            continue
+        question, marker, rag_context = message["content"].partition(
+            _RAG_CONTEXT_MARKER
+        )
+        if marker:
+            return index, question, rag_context
+    return None
+
+
+def _keep_rag_prefix(
+    conversation: Sequence[dict[str, str]],
+    rag_span: tuple[int, str, str],
+    rag_chars: int,
+) -> list[dict[str, str]]:
+    """Remove RAG characters from the back while preserving the full question."""
+    message_index, question, rag_context = rag_span
+    copied = [dict(message) for message in conversation]
+    if rag_chars > 0:
+        copied[message_index]["content"] = (
+            question + _RAG_CONTEXT_MARKER + rag_context[:rag_chars]
+        )
+    else:
+        copied[message_index]["content"] = question
+    return copied
+
+
+def _keep_system_suffix(
+    conversation: Sequence[dict[str, str]],
+    message_index: int,
+    system_prompt: str,
+    system_chars: int,
+) -> list[dict[str, str]]:
+    """Keep the most specific tail of the system instruction after RAG is gone."""
+    copied = [dict(message) for message in conversation]
+    copied[message_index]["content"] = (
+        system_prompt[-system_chars:] if system_chars > 0 else ""
+    )
+    return copied
+
+
+def _encode_training_pair(
+    processor: Any,
+    feature: dict[str, Any],
+    prompt: list[dict[str, str]],
+    answer: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    full = processor.encode(
+        _processor_sample(
+            feature,
+            prompt + [{"role": "assistant", "content": answer}],
+        ),
+        max_length=None,
+        add_generation_prompt=False,
+    )
+    prompt_only = processor.encode(
+        _processor_sample(feature, prompt),
+        max_length=None,
+        add_generation_prompt=True,
+    )
+    return full, prompt_only
+
+
+def _fit_kanana_prompt(
+    prompt: list[dict[str, str]],
+    max_length: int,
+    encode_prompt: Callable[[list[dict[str, str]]], Any],
+    encoded_length: Callable[[Any], int],
+    question_id: Any,
+    purpose: str,
+) -> Any:
+    """Fit one Kanana prompt while preserving image, question, and output suffix."""
+    encoded = encode_prompt(prompt)
+    if encoded_length(encoded) <= max_length:
+        return encoded
+
+    rag_span = _rag_context_span(prompt)
+    fixed_prompt = prompt
+    if rag_span is not None:
+        rag_context = rag_span[2]
+        best_encoding = None
+        low = 0
+        high = len(rag_context)
+        while low <= high:
+            kept_chars = (low + high) // 2
+            candidate_prompt = _keep_rag_prefix(prompt, rag_span, kept_chars)
+            candidate_encoding = encode_prompt(candidate_prompt)
+            candidate_length = encoded_length(candidate_encoding)
+            if candidate_length <= max_length:
+                best_encoding = candidate_encoding
+                low = kept_chars + 1
+            else:
+                high = kept_chars - 1
+        if best_encoding is not None:
+            return best_encoding
+        fixed_prompt = _keep_rag_prefix(prompt, rag_span, 0)
+
+    system_index = next(
+        (
+            index
+            for index, message in enumerate(fixed_prompt)
+            if message["role"] == "system"
+        ),
+        None,
+    )
+    if system_index is not None:
+        system_prompt = fixed_prompt[system_index]["content"]
+        best_encoding = None
+        low = 0
+        high = len(system_prompt)
+        while low <= high:
+            kept_chars = (low + high) // 2
+            candidate_prompt = _keep_system_suffix(
+                fixed_prompt, system_index, system_prompt, kept_chars
+            )
+            candidate_encoding = encode_prompt(candidate_prompt)
+            candidate_length = encoded_length(candidate_encoding)
+            if candidate_length <= max_length:
+                best_encoding = candidate_encoding
+                low = kept_chars + 1
+            else:
+                high = kept_chars - 1
+        if best_encoding is not None:
+            return best_encoding
+
+    raise ValueError(
+        f"{purpose.capitalize()} sample {question_id} exceeds --max-length after "
+        "removing RAG context and optional system text; image tokens, question, "
+        "and assistant answer or generation prompt were preserved. Reduce "
+        "--max-pixels or increase --max-length"
+    )
+
+
+def _encode_training_feature(
+    processor: Any,
+    feature: dict[str, Any],
+    prompt: list[dict[str, str]],
+    answer: str,
+    max_length: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Encode a training sample with shared max-length fitting policy."""
+
+    def encode_prompt(
+        candidate_prompt: list[dict[str, str]],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        return _encode_training_pair(
+            processor, feature, candidate_prompt, answer
+        )
+
+    def encoded_length(
+        pair: tuple[dict[str, Any], dict[str, Any]],
+    ) -> int:
+        return max(
+            _encoded_text_length(pair[0]),
+            _encoded_text_length(pair[1]),
+        )
+
+    return _fit_kanana_prompt(
+        prompt,
+        max_length,
+        encode_prompt,
+        encoded_length,
+        feature.get("question_id", "<unknown>"),
+        "training",
+    )
+
+
+def encode_kanana_generation_feature(
+    processor: Any,
+    feature: dict[str, Any],
+    max_length: int,
+) -> dict[str, Any]:
+    """Encode generation input with the same fitting policy used for training."""
+    prompt = _conversation(feature)
+
+    def encode_prompt(candidate_prompt: list[dict[str, str]]) -> dict[str, Any]:
+        return processor.encode(
+            _processor_sample(feature, candidate_prompt),
+            max_length=None,
+            add_generation_prompt=True,
+        )
+
+    return _fit_kanana_prompt(
+        prompt,
+        max_length,
+        encode_prompt,
+        _encoded_text_length,
+        feature.get("question_id", "<unknown>"),
+        "generation",
+    )
+
+
 @dataclass
 class TrainCollator:
     """Build a Kanana batch with assistant-only language-model labels."""
@@ -233,8 +550,8 @@ class TrainCollator:
         if not features:
             raise ValueError("TrainCollator received an empty batch")
 
-        full_samples: list[dict[str, Any]] = []
-        prompt_samples: list[dict[str, Any]] = []
+        full_encodings: list[dict[str, Any]] = []
+        prompt_encodings: list[dict[str, Any]] = []
         for feature in features:
             prompt = _conversation(feature)
             answer = feature.get("answer")
@@ -243,28 +560,27 @@ class TrainCollator:
                 raise ValueError(
                     f"Training sample {question_id} does not contain a non-empty answer"
                 )
-            prompt_samples.append(_processor_sample(feature, prompt))
-            full_samples.append(
-                _processor_sample(
-                    feature,
-                    prompt
-                    + [{"role": "assistant", "content": str(answer).strip()}],
-                )
+            full, prompt_only = _encode_training_feature(
+                self.processor,
+                feature,
+                prompt,
+                str(answer).strip(),
+                self.max_length,
             )
+            full_encodings.append(full)
+            prompt_encodings.append(prompt_only)
 
-        batch = self.processor.batch_encode_collate(
-            full_samples,
+        batch = self.processor.collate(
+            full_encodings,
             padding="longest",
             padding_side="right",
             max_length=self.max_length,
-            add_generation_prompt=False,
         )
-        prompt_batch = self.processor.batch_encode_collate(
-            prompt_samples,
+        prompt_batch = self.processor.collate(
+            prompt_encodings,
             padding="longest",
             padding_side="right",
             max_length=self.max_length,
-            add_generation_prompt=True,
         )
 
         input_ids = batch["input_ids"]
@@ -299,13 +615,15 @@ class GenerationCollator:
     def __call__(self, features: Sequence[dict[str, Any]]) -> dict[str, Any]:
         if not features:
             raise ValueError("GenerationCollator received an empty batch")
-        samples = [
-            _processor_sample(feature, _conversation(feature)) for feature in features
+        encodings = [
+            encode_kanana_generation_feature(
+                self.processor, feature, self.max_length
+            )
+            for feature in features
         ]
-        return self.processor.batch_encode_collate(
-            samples,
+        return self.processor.collate(
+            encodings,
             padding="longest",
             padding_side="left",
             max_length=self.max_length,
-            add_generation_prompt=True,
         )

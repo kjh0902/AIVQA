@@ -24,71 +24,44 @@ def _normalize_mc_answer(text: str) -> tuple[str, ...] | str:
     return tuple(sorted(set(choices))) if choices else normalized
 
 
-def _rouge_l_f1(prediction: str, reference: str) -> float:
+def _rouge_1_f1(prediction: str, reference: str) -> float:
+    """Compute sentence-level ROUGE-1 F1 from clipped unigram overlap."""
     predicted_tokens = _tokenize(prediction)
     reference_tokens = _tokenize(reference)
     if not predicted_tokens or not reference_tokens:
         return float(predicted_tokens == reference_tokens)
 
-    previous = [0] * (len(reference_tokens) + 1)
-    for predicted_token in predicted_tokens:
-        current = [0]
-        for column, reference_token in enumerate(reference_tokens, start=1):
-            if predicted_token == reference_token:
-                current.append(previous[column - 1] + 1)
-            else:
-                current.append(max(previous[column], current[-1]))
-        previous = current
-
-    lcs_length = previous[-1]
-    precision = lcs_length / len(predicted_tokens)
-    recall = lcs_length / len(reference_tokens)
+    overlap = sum(
+        (Counter(predicted_tokens) & Counter(reference_tokens)).values()
+    )
+    precision = overlap / len(predicted_tokens)
+    recall = overlap / len(reference_tokens)
     return 2 * precision * recall / (precision + recall) if precision + recall else 0.0
 
 
-def _ngrams(tokens: Sequence[str], order: int) -> Counter[tuple[str, ...]]:
-    return Counter(tuple(tokens[index : index + order]) for index in range(len(tokens) - order + 1))
-
-
-def _corpus_bleu(predictions: Sequence[str], references: Sequence[str]) -> float:
-    """Compute corpus BLEU-4 with effective order and add-one smoothing."""
-    matches_by_order = [0, 0, 0, 0]
-    possible_by_order = [0, 0, 0, 0]
-    prediction_length = 0
-    reference_length = 0
-
-    for prediction, reference in zip(predictions, references):
-        predicted_tokens = _tokenize(prediction)
-        reference_tokens = _tokenize(reference)
-        prediction_length += len(predicted_tokens)
-        reference_length += len(reference_tokens)
-        for order in range(1, 5):
-            predicted_ngrams = _ngrams(predicted_tokens, order)
-            reference_ngrams = _ngrams(reference_tokens, order)
-            matches_by_order[order - 1] += sum(
-                min(count, reference_ngrams[ngram])
-                for ngram, count in predicted_ngrams.items()
-            )
-            possible_by_order[order - 1] += sum(predicted_ngrams.values())
-
-    if prediction_length == 0:
-        return float(reference_length == 0)
-
-    precisions = []
-    for matches, possible in zip(matches_by_order, possible_by_order):
-        if possible == 0:
-            continue
-        precisions.append((matches + 1.0) / (possible + 1.0))
-    if not precisions:
+def _sentence_bleu_1(prediction: str, reference: str) -> float:
+    """Compute sentence-level BLEU-1 with clipped unigram precision."""
+    predicted_tokens = _tokenize(prediction)
+    reference_tokens = _tokenize(reference)
+    if not predicted_tokens:
+        return float(not reference_tokens)
+    if not reference_tokens:
         return 0.0
 
-    geometric_mean = math.exp(sum(math.log(value) for value in precisions) / len(precisions))
-    brevity_penalty = (
-        1.0
-        if prediction_length > reference_length
-        else math.exp(1.0 - reference_length / prediction_length)
+    overlap = sum(
+        (Counter(predicted_tokens) & Counter(reference_tokens)).values()
     )
-    return brevity_penalty * geometric_mean
+    unigram_precision = overlap / len(predicted_tokens)
+    if unigram_precision == 0.0:
+        return 0.0
+
+    if len(predicted_tokens) >= len(reference_tokens):
+        brevity_penalty = 1.0
+    else:
+        brevity_penalty = math.exp(
+            1.0 - len(reference_tokens) / len(predicted_tokens)
+        )
+    return brevity_penalty * unigram_precision
 
 
 def compute_vqa_metrics(
@@ -127,16 +100,17 @@ def compute_vqa_metrics(
 
     la_pairs = grouped["LA"]
     rouge = (
-        sum(_rouge_l_f1(prediction, reference) for prediction, reference in la_pairs)
+        sum(_rouge_1_f1(prediction, reference) for prediction, reference in la_pairs)
         / len(la_pairs)
         if la_pairs
         else 0.0
     )
     bleu = (
-        _corpus_bleu(
-            [prediction for prediction, _ in la_pairs],
-            [reference for _, reference in la_pairs],
+        sum(
+            _sentence_bleu_1(prediction, reference)
+            for prediction, reference in la_pairs
         )
+        / len(la_pairs)
         if la_pairs
         else 0.0
     )
